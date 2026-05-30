@@ -25,6 +25,7 @@ scikit-learn==1.5.2
 loguru==0.7.3
 apscheduler==3.10.4
 httpx==0.28.0
+yfinance==0.2.36
 python-multipart==0.0.12
 pytest==8.3.4
 pytest-asyncio==0.24.0

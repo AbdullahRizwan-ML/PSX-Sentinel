@@ -2,8 +2,8 @@
 PSX Sentinel — Celery Task Definitions
 
 Contains the two primary background tasks:
-1. run_analysis — runs the 4-agent analysis pipeline for a single ticker
-2. run_nightly_pipeline — queues analysis for all configured tickers
+1. run_analysis — runs the data collection pipeline for a single ticker
+2. run_nightly_pipeline — runs the full pipeline for all configured tickers
 
 Both tasks are sync Celery functions that create their own async event
 loops internally. This is the standard pattern for running async code
@@ -30,15 +30,15 @@ from app.workers.celery_app import celery_app
 )
 def run_analysis(self, ticker: str) -> dict:
     """
-    Run the 4-agent analysis pipeline for a single ticker.
+    Run the data collection pipeline for a single ticker.
 
     This is a sync Celery task that creates its own async event loop
-    to run the async analysis pipeline.
+    to run the async pipeline.
 
     Steps:
     1. Log task start with task ID
     2. Create a new async event loop (Celery workers don't have one)
-    3. Run the async analysis pipeline inside the loop
+    3. Run the async pipeline inside the loop
     4. On failure: retry up to max_retries times with 30s delay
     5. Clean up the Redis analysis lock on completion
     6. Return result dict with ticker and status
@@ -78,35 +78,20 @@ async def _run_analysis_async(ticker: str) -> dict:
     """
     Async implementation of the analysis pipeline.
 
-    Creates its own DB session and Redis client for this task's
-    lifetime, isolated from the FastAPI request lifecycle.
-
-    In Phase 2, this will import and run the AnalysisOrchestrator.
-    Currently returns a confirmation dict to verify the pipeline runs.
+    Creates its own DB session isolated from the FastAPI request
+    lifecycle. Runs the full data pipeline for a single ticker,
+    then cleans up the Redis analysis lock.
     """
-    from app.core.redis_client import RedisClient
+    from app.collectors.pipeline import run_full_pipeline
+    from app.core.redis_client import redis_client
     from app.db.session import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        redis = RedisClient()
         try:
-            # Phase 2: Replace with real orchestrator call:
-            # from app.agents.orchestrator import AnalysisOrchestrator
-            # orchestrator = AnalysisOrchestrator(db, redis)
-            # report = await orchestrator.analyze(ticker)
-            # return {"report_id": str(report.id), "ticker": ticker}
-
-            logger.info(
-                f"Analysis pipeline executing for {ticker} — "
-                f"orchestrator will be connected in Phase 2"
-            )
-            return {"ticker": ticker, "status": "pipeline_ready"}
-
+            result = await run_full_pipeline(db, tickers=[ticker])
+            return result
         finally:
-            await redis.close()
             # Clean up the analysis lock
-            from app.core.redis_client import redis_client
-
             await redis_client.delete_cached(
                 f"analysis_running:{ticker}"
             )
@@ -141,45 +126,46 @@ def _cleanup_lock(ticker: str) -> None:
 )
 def run_nightly_pipeline() -> dict:
     """
-    Nightly pipeline: queue analysis tasks for all configured tickers.
+    Nightly pipeline: run the full data collection pipeline for all tickers.
 
     Runs at NIGHTLY_PIPELINE_HOUR (default 8 PM PKT) via Celery Beat.
-    Each ticker gets its own run_analysis task queued to the analysis
-    queue, enabling parallel processing across workers.
+    Unlike Phase 1B which fanned out per-ticker tasks, this now runs
+    the full pipeline in a single pass — the pipeline orchestrator
+    handles all tickers sequentially within one task.
 
     Steps:
     1. Read ticker list from settings
-    2. Queue an individual run_analysis task for each ticker
-    3. Log the queued tickers
-    4. Return summary dict with count and ticker list
+    2. Create a new async event loop
+    3. Run the full pipeline with all tickers
+    4. Return combined results dict
     """
     from app.core.config import get_settings
 
     settings = get_settings()
     tickers = settings.tickers_list
     logger.info(
-        f"Nightly pipeline started — "
-        f"queuing {len(tickers)} tickers for analysis"
+        f"Nightly pipeline started -- "
+        f"{len(tickers)} tickers: {', '.join(tickers)}"
     )
 
-    queued_tasks = []
-    for ticker in tickers:
-        task = run_analysis.apply_async(
-            args=[ticker],
-            queue="analysis",
-        )
-        queued_tasks.append(ticker)
-        logger.info(
-            f"Queued analysis for {ticker} — task_id={task.id}"
-        )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    logger.info(
-        f"Nightly pipeline complete — "
-        f"{len(queued_tasks)} tickers queued"
-    )
+    try:
+        from app.collectors.pipeline import run_full_pipeline
+        from app.db.session import AsyncSessionLocal
 
-    return {
-        "status": "queued",
-        "tickers_queued": len(queued_tasks),
-        "tickers": queued_tasks,
-    }
+        async def _run():
+            async with AsyncSessionLocal() as db:
+                return await run_full_pipeline(db, tickers)
+
+        result = loop.run_until_complete(_run())
+        logger.info(f"Nightly pipeline complete: {result}")
+        return result
+    except Exception as e:
+        logger.error(
+            f"Nightly pipeline failed: {type(e).__name__}: {e}"
+        )
+        return {"status": "failed", "error": str(e)}
+    finally:
+        loop.close()

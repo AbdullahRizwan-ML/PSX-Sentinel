@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"Nightly pipeline scheduled at {settings.NIGHTLY_PIPELINE_HOUR}:00 PKT"
     )
+    logger.info("Pipeline endpoints: /api/v1/pipeline/trigger-sync")
     logger.info("PSX Sentinel ready [OK]")
 
     yield
@@ -211,8 +212,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ── Router Registration ──────────────────────────────────────────────────────
 
 from app.api.v1 import auth, companies, health, intelligence  # noqa: E402
+from app.api.v1 import pipeline as pipeline_router  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(companies.router, prefix="/api/v1")
 app.include_router(intelligence.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
+app.include_router(pipeline_router.router, prefix="/api/v1/pipeline")
