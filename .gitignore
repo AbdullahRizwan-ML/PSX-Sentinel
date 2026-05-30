@@ -1,0 +1,28 @@
+# Environment
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Python
+backend/venv/
+backend/env/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Logs
+backend/logs/
+*.log
+
+# Alembic auto-generated migrations
+backend/alembic/versions/*.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
