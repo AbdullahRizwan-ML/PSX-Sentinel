@@ -1,21 +1,26 @@
 """
 PSX Sentinel — Price Data Collector
 
-Collects end-of-day OHLCV price data for PSX tickers using yfinance.
+Collects end-of-day OHLCV price data for PSX tickers from the
+PSX Data Portal Service (DPS) timeseries API.
 
-PRIMARY SOURCE: Yahoo Finance with .KA suffix (e.g. "ENGRO.KA")
-FALLBACK: If yfinance returns no data for a ticker, logs a warning
-          and continues to the next ticker. Never crashes on a single
-          ticker failure.
+PRIMARY SOURCE: https://dps.psx.com.pk/timeseries/eod/{ticker}
+RESPONSE FORMAT: {"status": 1, "data": [[unix_ts, open, volume, close], ...]}
 
-yfinance is synchronous — all calls are wrapped in asyncio.to_thread()
-to avoid blocking the async event loop.
+NOTE: The DPS API does not provide High/Low values separately.
+      High = max(open, close), Low = min(open, close) as approximations.
+      This is acceptable for trend analysis and ML features. Intraday
+      highs/lows would require tick-level data from a paid PSX feed.
+
+PREVIOUS SOURCE (removed): yfinance with .KA suffix — permanently
+      broken due to Cloudflare blocking by Yahoo Finance.
 """
 
-import asyncio
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
+import httpx
+import pandas as pd
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,31 +31,41 @@ from app.db.models import DailyPrice
 
 class PriceCollector(BaseCollector):
     """
-    Downloads 2 years of daily OHLCV data per ticker from Yahoo Finance.
+    Downloads up to 2 years of daily EOD data per ticker from PSX DPS.
 
-    Yahoo Finance PSX symbols use the .KA suffix (Karachi Stock Exchange).
-    Data is inserted with a per-row duplicate check against the unique
-    constraint on (ticker, date) to support incremental updates.
+    The PSX Data Portal Service is the official data source operated
+    by the Pakistan Stock Exchange. Data is inserted with a per-row
+    duplicate check against the unique constraint on (ticker, date)
+    to support incremental updates.
     """
 
     name = "price_collector"
 
-    PSX_SUFFIX = ".KA"
-    SLEEP_BETWEEN_TICKERS = 2.0  # seconds — respect Yahoo rate limits
+    DPS_BASE_URL = "https://dps.psx.com.pk/timeseries/eod"
+    SLEEP_BETWEEN_TICKERS = 1.0  # PSX DPS is generous with rate limits
     HISTORY_DAYS = 730  # 2 years of daily data
+
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://dps.psx.com.pk/",
+        "Accept": "application/json, text/javascript, */*",
+    }
 
     async def collect(self, tickers: list[str]) -> dict:
         """
-        Fetch last 2 years of daily OHLCV data for each ticker.
+        Fetch up to 2 years of daily EOD data for each ticker
+        from the PSX DPS timeseries API.
 
         For each ticker:
-        1. Build Yahoo Finance symbol: f"{ticker}.KA"
-        2. Use asyncio.to_thread to call yfinance in a thread
-           (yfinance is synchronous)
-        3. Download 2y of daily data using yf.download()
-        4. Parse each row into a DailyPrice record
-        5. Check UniqueConstraint on (ticker, date) before inserting
-        6. Sleep between tickers to respect rate limits
+        1. GET https://dps.psx.com.pk/timeseries/eod/{ticker}
+        2. Parse JSON response: [unix_ts, open, volume, close]
+        3. Derive high = max(open, close), low = min(open, close)
+        4. Build DataFrame and insert via _insert_prices()
+        5. Sleep between tickers
 
         Returns summary dict with counts.
         """
@@ -58,26 +73,15 @@ class PriceCollector(BaseCollector):
         failed = 0
         total_inserted = 0
 
-        end_date = datetime.utcnow().date()
-        start_date = end_date - timedelta(days=self.HISTORY_DAYS)
-
         for ticker in tickers:
             try:
-                symbol = f"{ticker}{self.PSX_SUFFIX}"
-                logger.info(f"Fetching price data for {symbol}")
+                logger.info(f"Fetching price data for {ticker} from PSX DPS")
 
-                # Run synchronous yfinance in a thread pool
-                df = await asyncio.to_thread(
-                    self._fetch_yfinance,
-                    symbol,
-                    start_date.isoformat(),
-                    end_date.isoformat(),
-                )
+                df = await self._fetch_psx_dps(ticker)
 
                 if df is None or df.empty:
                     logger.warning(
-                        f"No price data returned for {symbol}. "
-                        f"Yahoo Finance may not have data for this ticker."
+                        f"No price data returned for {ticker} from PSX DPS."
                     )
                     failed += 1
                     await self.sleep(self.SLEEP_BETWEEN_TICKERS)
@@ -89,7 +93,7 @@ class PriceCollector(BaseCollector):
                 processed += 1
                 logger.info(
                     f"{ticker}: {inserted} price records inserted "
-                    f"({len(df)} rows fetched from Yahoo Finance)"
+                    f"({len(df)} rows fetched from PSX DPS)"
                 )
 
             except Exception as e:
@@ -107,39 +111,99 @@ class PriceCollector(BaseCollector):
             "records_inserted": total_inserted,
         }
 
-    def _fetch_yfinance(
-        self, symbol: str, start: str, end: str
-    ):
+    async def _fetch_psx_dps(self, ticker: str):
         """
-        Synchronous yfinance call — runs in thread pool via to_thread().
+        Fetch EOD price data from PSX DPS timeseries API.
 
-        Returns a pandas DataFrame with columns: Open, High, Low, Close, Volume.
-        Returns None on any error to ensure the caller handles gracefully.
+        Returns a pandas DataFrame with columns matching what
+        _insert_prices() expects: date (as index), open, high,
+        low, close, volume, change_pct.
 
-        Uses auto_adjust=True to get adjusted prices that account for
-        splits and dividends.
+        Returns None on any error.
         """
-        import yfinance as yf
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=self.HISTORY_DAYS)
+
+        url = f"{self.DPS_BASE_URL}/{ticker}"
+        params = {
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat(),
+        }
 
         try:
-            df = yf.download(
-                symbol,
-                start=start,
-                end=end,
-                progress=False,
-                auto_adjust=True,
-            )
-            if df is None or df.empty:
-                return None
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    url, headers=self.HEADERS, params=params
+                )
 
-            # Flatten MultiIndex columns if yfinance returns them
-            # (happens when downloading a single ticker in newer versions)
-            if hasattr(df.columns, "levels") and df.columns.nlevels > 1:
-                df.columns = df.columns.get_level_values(0)
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"PSX DPS {resp.status_code} for {ticker}: "
+                        f"{resp.text[:200]}"
+                    )
+                    return None
 
-            return df
+                payload = resp.json()
+
+                if payload.get("status") != 1 or not payload.get("data"):
+                    logger.warning(
+                        f"PSX DPS empty for {ticker}: "
+                        f"{payload.get('message', 'no message')}"
+                    )
+                    return None
+
+                rows = []
+                for item in payload["data"]:
+                    # item = [unix_timestamp, open, volume, close]
+                    if len(item) < 4:
+                        continue
+
+                    ts, open_p, volume, close_p = (
+                        item[0], item[1], item[2], item[3]
+                    )
+                    price_date = datetime.fromtimestamp(
+                        ts, tz=timezone.utc
+                    ).date()
+                    open_f = float(open_p)
+                    close_f = float(close_p)
+                    high_f = max(open_f, close_f)
+                    low_f = min(open_f, close_f)
+                    vol_i = int(volume)
+                    change = round(
+                        ((close_f - open_f) / open_f * 100)
+                        if open_f > 0
+                        else 0.0,
+                        4,
+                    )
+                    rows.append(
+                        {
+                            "date": price_date,
+                            "open": open_f,
+                            "high": high_f,
+                            "low": low_f,
+                            "close": close_f,
+                            "volume": vol_i,
+                            "change_pct": change,
+                        }
+                    )
+
+                if not rows:
+                    logger.warning(
+                        f"PSX DPS: 0 parseable rows for {ticker}"
+                    )
+                    return None
+
+                df = pd.DataFrame(rows)
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date")
+                logger.info(
+                    f"PSX DPS: {len(df)} rows for {ticker} "
+                    f"({df.index.min().date()} -> {df.index.max().date()})"
+                )
+                return df
+
         except Exception as e:
-            logger.error(f"yfinance error for {symbol}: {e}")
+            logger.error(f"PSX DPS fetch failed for {ticker}: {e}")
             return None
 
     async def _insert_prices(self, ticker: str, df) -> int:

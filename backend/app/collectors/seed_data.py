@@ -7,6 +7,14 @@ because all data tables have foreign keys pointing to companies.ticker.
 
 The seed function is idempotent — it skips tickers that already exist,
 making it safe to run on every pipeline execution.
+
+FUTURE ENRICHMENT SOURCE (Phase 2B):
+    Sarmaaya.pk (https://sarmaaya.pk/indexes/KSE100) is a PSX-authorized
+    data redistributor that provides live KSE-100 data including market
+    cap, P/E ratio, and 52-week high/low for all listed companies. The
+    page is JavaScript-rendered, so scraping requires Playwright. Once
+    available, use it to keep market_cap_pkr and other fundamentals
+    updated automatically instead of using static seed values.
 """
 
 from loguru import logger

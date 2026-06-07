@@ -4,21 +4,27 @@ PSX Sentinel — News Collector
 Collects financial news articles from Pakistani RSS feeds and matches
 them to monitored PSX tickers using keyword matching.
 
-SOURCES:
-1. Dawn Business:        https://www.dawn.com/business/rss
-2. Business Recorder:    https://www.brecorder.com/rss/home
-3. Profit Pakistan Today: https://profit.pakistantoday.com.pk/feed/
+ACTIVE SOURCES:
+1. ARY News Business: https://arynews.tv/category/business/feed/
 
-feedparser is synchronous — calls are wrapped in asyncio.to_thread().
+SOURCES REMOVED (Cloudflare blocked — HTTP 403):
+- Dawn Business:        https://www.dawn.com/business/rss
+- Business Recorder:    https://www.brecorder.com/rss/home
+- Profit Pakistan Today: https://profit.pakistantoday.com.pk/feed/
+
+FUTURE SOURCES (Phase 2B, requires Playwright):
+- Sarmaaya.pk: https://sarmaaya.pk (PSX-authorized data vendor)
+
+feedparser is used for XML parsing after httpx fetches the raw feed.
 """
 
-import asyncio
 import html as html_lib
 import re
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
 import feedparser
+import httpx
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,10 +49,16 @@ class NewsCollector(BaseCollector):
     name = "news_collector"
 
     RSS_FEEDS = {
-        "dawn": "https://www.dawn.com/business/rss",
-        "brecorder": "https://www.brecorder.com/rss/home",
-        "profit_today": "https://profit.pakistantoday.com.pk/feed/",
+        "arynews": "https://arynews.tv/category/business/feed/",
     }
+
+    # SOURCES REMOVED (Cloudflare blocked):
+    # Dawn Business: https://www.dawn.com/business/rss  -> 403
+    # Business Recorder: https://www.brecorder.com/rss/home -> 403
+    # Profit Today: https://profit.pakistantoday.com.pk/feed/ -> 403
+    #
+    # FUTURE SOURCES to add when Playwright is available (Phase 2B):
+    # Sarmaaya.pk: https://sarmaaya.pk (PSX-authorized data vendor)
 
     async def collect(self, tickers: list[str]) -> dict:
         """
@@ -91,27 +103,18 @@ class NewsCollector(BaseCollector):
             try:
                 logger.info(f"Fetching RSS feed: {source} ({feed_url})")
 
-                # feedparser is synchronous — run in thread pool
-                feed = await asyncio.to_thread(
-                    feedparser.parse, feed_url
-                )
-
-                if feed.bozo and not feed.entries:
-                    logger.warning(
-                        f"RSS feed {source} returned no entries "
-                        f"(bozo={feed.bozo}, "
-                        f"exception={feed.get('bozo_exception', 'none')})"
-                    )
+                entries = await self._fetch_feed_safe(source, feed_url)
+                if not entries:
                     failed += 1
                     continue
 
                 inserted = await self._process_feed_entries(
-                    feed.entries, source, ticker_lookup
+                    entries, source, ticker_lookup
                 )
                 total_inserted += inserted
                 processed += 1
                 logger.info(
-                    f"{source}: {len(feed.entries)} entries fetched, "
+                    f"{source}: {len(entries)} entries fetched, "
                     f"{inserted} articles inserted"
                 )
 
@@ -129,6 +132,62 @@ class NewsCollector(BaseCollector):
             "tickers_failed": failed,
             "records_inserted": total_inserted,
         }
+
+    async def _fetch_feed_safe(self, name: str, url: str) -> list:
+        """
+        Fetch RSS via httpx with proper headers, clean XML,
+        then parse with feedparser. Returns entries list.
+
+        This two-step approach (httpx fetch + feedparser parse) avoids
+        Cloudflare blocks that occur when feedparser fetches directly.
+        Also cleans invalid XML characters that break feedparser.
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "application/rss+xml, application/xml, "
+                "text/xml, */*"
+            ),
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=20.0, follow_redirects=True
+            ) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"RSS {name} HTTP {resp.status_code}"
+                    )
+                    return []
+
+                text = resp.text
+                # Remove invalid XML control characters
+                text = re.sub(
+                    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text
+                )
+                # Fix unescaped ampersands outside valid XML entities
+                text = re.sub(
+                    r"&(?!(amp|lt|gt|quot|apos|#\d+|"
+                    r"#x[0-9a-fA-F]+);)",
+                    "&amp;",
+                    text,
+                )
+
+                feed = feedparser.parse(text)
+                entries = getattr(feed, "entries", [])
+                logger.info(
+                    f"RSS {name}: {len(entries)} entries "
+                    f"(bozo={feed.bozo})"
+                )
+                return entries
+
+        except Exception as e:
+            logger.warning(f"RSS {name} fetch error: {e}")
+            return []
 
     async def _process_feed_entries(
         self,
