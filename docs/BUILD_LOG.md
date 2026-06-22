@@ -200,6 +200,52 @@ philosophy to control token usage and rate-limit exhaustion.
 
 Not yet run. Will be executed via Claude Code going forward.
 
+## 2026-06-23 — Phase 2B Session 1 built: four specialist agents
+
+Built via Claude Code (Opus 4.6 session): 4 files in `backend/app/agents/` —
+`trend_analyzer.py`, `news_synthesizer.py`, `filing_skeptic.py`,
+`arbitrator.py`. Written against the actual existing interfaces (read
+`agents/base.py`, `db/models.py`, `core/llm_gateway.py` first rather than
+assuming signatures):
+
+- `TrendAnalyzer` — computes MA20/MA50, RSI(14), 1w/1m/3m momentum, volume
+  trend, and 52-week range position in pure Python from `context.recent_prices`,
+  then makes one LLM call to interpret the numbers into a signal
+  (STRONG_BUY..STRONG_SELL) with reasoning. Confidence scales with how many
+  price data points were available (0.2 to 0.85).
+- `NewsSynthesizer` — skips the LLM call entirely when `context.news_articles`
+  is empty (confidence 0.3, no hallucination). When articles exist, the
+  prompt explicitly instructs the model to judge genuine relevance vs.
+  tangential keyword matches (the PPL/PSO "petroleum" false-positive problem
+  noted in Known Issues) and report a separate `RELEVANT_ARTICLES` count.
+- `FilingSceptic` — skips the LLM call entirely when no announcement has
+  non-empty `raw_text` (current state: always, since PUCARS scraping isn't
+  built yet). Returns confidence 0.2 and an honest "no filing data available"
+  message rather than fabricating analysis. The LLM red-flag-auditor path is
+  fully implemented and ready to activate once Phase 2A+ adds real filing text.
+- `Arbitrator` — computes the conviction score (0-100) deterministically in
+  Python first using the confidence-weighted formula from the spec (technical
+  signal × its confidence, news sentiment × its confidence, filing red-flag
+  penalty only), then makes one LLM call to write bull_case/bear_case/
+  risk_factors narrative around the pre-computed score. The LLM never
+  decides the number.
+
+**Verified this session (syntax/structure only — not yet runtime):**
+- All four files confirmed present on disk via `Glob`.
+- All four parsed cleanly with Python's `ast.parse()` — no syntax errors.
+- Manually cross-checked each agent's constructor and `run()` signature
+  against `agents/base.py`'s actual `BaseAgent`/`AgentContext`/`AgentResult`
+  definitions (not assumed from the prompt spec) before writing code.
+
+**Explicitly NOT verified yet** (next session's job): no `AnalysisOrchestrator`
+exists to actually instantiate these agents with a real `LLMGateway` and
+`AsyncSession`, build a populated `AgentContext` from the live database, and
+run them end-to-end. No live LLM call has been made by any of these four
+agents. Per this project's working convention, these agents are not to be
+treated as "done" until that live run happens and is checked against the
+database/logs directly — current state is "written and import-safe," not
+"working."
+
 ---
 
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->
