@@ -42,10 +42,7 @@ from app.schemas.company import (
     PaginatedResponse,
     PricePoint,
 )
-from app.schemas.intelligence import (
-    AnalysisJobResponse,
-    IntelligenceReportResponse,
-)
+from app.schemas.intelligence import IntelligenceReportResponse
 
 settings = get_settings()
 
@@ -474,22 +471,23 @@ async def get_latest_report(
 
 @router.post(
     "/companies/{ticker}/analyze",
-    response_model=AnalysisJobResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger a new intelligence analysis for a company",
+    response_model=IntelligenceReportResponse,
+    summary="Run the 4-agent analysis pipeline for a company",
 )
 async def trigger_analysis(
     ticker: str,
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
-) -> AnalysisJobResponse:
+) -> IntelligenceReportResponse:
     """
-    Queue a Celery task to run the 4-agent analysis pipeline.
+    Run the full 4-agent analysis pipeline synchronously and return
+    the saved IntelligenceReport.
 
     - Validates that the ticker exists in the Company table
     - Checks if analysis is already running (429 if so)
     - Sets a Redis lock for 300 seconds to prevent duplicate runs
-    - Queues the Celery task and returns the job ID
+    - Runs TrendAnalyzer, NewsSynthesizer, FilingSceptic, Arbitrator
+    - Returns the persisted IntelligenceReport
     """
     try:
         result = await db.execute(
@@ -509,7 +507,6 @@ async def trigger_analysis(
             detail="Database error",
         )
 
-    # Check if analysis is already running
     running_key = f"analysis_running:{ticker.upper()}"
     already_running = await redis_client.get_cached(running_key)
     if already_running:
@@ -519,27 +516,38 @@ async def trigger_analysis(
             f"Please wait for it to complete.",
         )
 
-    # Set lock to prevent duplicate runs
     await redis_client.set_cached(running_key, "1", ttl_seconds=300)
 
-    # Queue Celery task
-    from app.workers.tasks import run_analysis
+    try:
+        from app.agents.orchestrator import AnalysisOrchestrator
 
-    task = run_analysis.delay(ticker.upper())
+        orchestrator = AnalysisOrchestrator(db)
+        analysis = await orchestrator.analyze(ticker.upper())
+        report = analysis["report"]
 
-    logger.info(
-        f"Analysis queued for {ticker.upper()} — "
-        f"task_id={task.id} by user={user.email}"
-    )
+        logger.info(
+            f"Analysis complete for {ticker.upper()} "
+            f"by user={user.email}"
+        )
 
-    return AnalysisJobResponse(
-        job_id=str(task.id),
-        ticker=ticker.upper(),
-        status="queued",
-        message=f"Analysis queued for {ticker.upper()}. "
-        f"Results will be available in ~60 seconds.",
-        estimated_seconds=60,
-    )
+        return IntelligenceReportResponse.model_validate(report)
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error(
+            f"Analysis failed for {ticker}: "
+            f"{type(e).__name__}: {e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Analysis failed: {type(e).__name__}",
+        )
+    finally:
+        await redis_client.delete_cached(running_key)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -246,6 +246,82 @@ treated as "done" until that live run happens and is checked against the
 database/logs directly — current state is "written and import-safe," not
 "working."
 
+## 2026-06-23 — Phase 2B Session 2 built: AnalysisOrchestrator, live-verified
+
+Built via Claude Code (Opus 4.6 session): `backend/app/agents/orchestrator.py`
+(new), `backend/app/api/v1/companies.py` (modified), `backend/app/workers/tasks.py`
+(modified), `backend/scripts/test_analysis.py` (new, standalone verification
+script). None of the four agent files (`trend_analyzer.py`, `news_synthesizer.py`,
+`filing_skeptic.py`, `arbitrator.py`) were modified — confirmed via `git status -u`
+showing them absent from both the modified and untracked lists. No bugs found in
+any of them while wiring up.
+
+**Pre-flight check (run before touching any agent code):** confirmed
+`GROQ_API_KEY` and `GEMINI_API_KEY` present in environment, then made one
+trivial direct call through `LLMGateway.complete()` outside of any agent
+context — Groq responded "PONG" successfully. Only proceeded to build the
+orchestrator after this passed.
+
+**FK-ordering detail discovered while reading `db/models.py`:** `LLMCall.analysis_id`
+is a foreign key into `intelligence_reports.id`. This meant the `IntelligenceReport`
+row has to be created and flushed to the DB *before* any agent runs and makes an
+LLM call — otherwise the audit-log insert inside `LLMGateway.complete()` would have
+no valid FK target. The orchestrator creates the report row first with placeholder
+values (`conviction_score=50.0`, `technical_signal="NEUTRAL"`, in-progress text),
+then overwrites those fields once the agents finish.
+
+**Live run against 2 real tickers, verified via direct SQL (not log output) against
+`intelligence_reports` and `llm_calls`:**
+
+- **PPL** (has 9 matched news articles): `trend_analyzer` called LLM (Groq, 339
+  tokens, confidence 0.85), `news_synthesizer` called LLM (Groq, 697 tokens,
+  confidence 0.30), `filing_skeptic` skipped (0 tokens, confidence 0.20, no
+  filing data), `arbitrator` called LLM (Groq, 687 tokens, confidence 0.55).
+  Persisted report: conviction_score=58.5, technical_signal=NEUTRAL,
+  total_tokens_used=1723, generation_time≈14.6s.
+- **MCB** (0 matched news articles): `trend_analyzer` called LLM (343 tokens,
+  confidence 0.85), `news_synthesizer` skipped entirely (0 tokens, confidence
+  0.30, zero articles — confirmed by total absence of a `news_synthesizer` row
+  in `llm_calls` for MCB's report id), `filing_skeptic` skipped (0 tokens),
+  `arbitrator` called LLM (575 tokens, confidence 0.55). Persisted report:
+  conviction_score=58.5, technical_signal=NEUTRAL, total_tokens_used=918,
+  generation_time≈4.1s.
+- SQL confirmed: 2 new `intelligence_reports` rows, 5 new `llm_calls` rows (all
+  `model=llama-3.3-70b-versatile`, all `status=SUCCESS` — Gemini fallback never
+  triggered since Groq succeeded every call), grouped-by-agent counts showing
+  `trend_analyzer: 2`, `news_synthesizer: 1`, `arbitrator: 2`, and zero rows for
+  `filing_skeptic` — direct proof it was skipped for both tickers. A LEFT JOIN
+  from `intelligence_reports` to `llm_calls` confirmed exactly which agent fired
+  for which ticker.
+- `pipeline_runs` was checked and confirmed **not** used by this orchestrator —
+  that table only logs the data-collection pipeline (`run_full_pipeline`), not
+  agent analysis runs. Agent-run auditing lives entirely in `intelligence_reports`
+  + `llm_calls`. Not assumed — checked directly.
+
+**Investigated finding: both tickers produced an identical conviction score
+(58.5). Confirmed NOT a bug.** Pulled `score_breakdown` from `agent_outputs` for
+both reports: `technical_contribution=8.5` for both (the only nonzero term),
+`news_contribution=0.0` for both, `filing_contribution=0.0` for both,
+`ml_contribution=0.0` for both (Phase 3 placeholder, confirmed still inert).
+The zero news contributions have two different causes that currently look
+identical in the final number: PPL's `NewsSynthesizer` actually called the LLM
+(697 tokens spent) and the LLM judged the 9 keyword-matched articles as
+genuinely NEUTRAL relevance/sentiment — a real judgment, not a skip. MCB's
+`NewsSynthesizer` skipped its LLM call entirely because there were zero
+articles to begin with. The current scoring formula has no way to distinguish
+"a real neutral signal" from "no signal at all" — both currently produce 0.0
+contribution. Filed as a known issue (see `docs/KNOWN_ISSUES.md`) rather than
+treated as a defect to fix in this session, since fixing it would mean changing
+the Arbitrator's scoring formula, which was explicitly out of scope.
+
+**Wiring changes:** `POST /companies/{ticker}/analyze` now runs the orchestrator
+inline (async, non-blocking) and returns the saved `IntelligenceReportResponse`
+directly instead of queuing a Celery task and returning 202. The Celery
+`run_analysis` task's placeholder (which incorrectly called the data-collection
+pipeline, not agent analysis) was replaced with a call into the same
+`AnalysisOrchestrator`, so the nightly/background path and the on-demand API
+path now share one code path rather than diverging.
+
 ---
 
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

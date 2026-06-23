@@ -77,6 +77,37 @@ Until then, that term contributes 0 to the score — the formula is structured
 to make plugging it in later straightforward, but the conviction scores 
 produced by Phase 2B alone are necessarily incomplete.
 
+### Conviction scores currently cluster near 50-60 for most tickers
+
+Live verification of Phase 2B Session 2's `AnalysisOrchestrator` (see Build
+Log, 2026-06-23) showed both test tickers (PPL, MCB) producing an identical
+conviction score of 58.5, despite very different underlying data (PPL had 9
+matched news articles, MCB had 0). This is correct behavior given the current
+scoring formula and data conditions, not a bug — but the underlying cause is
+worth tracking as an open issue.
+
+`technical_contribution` is currently the only scoring term that is
+consistently nonzero, because:
+- `news_contribution` is frequently 0.0, but for two different reasons that
+  currently look identical in the final score: a genuine NEUTRAL sentiment
+  judgment from `NewsSynthesizer` (it called the LLM and judged the articles
+  as not meaningfully bullish/bearish — see the noisy-keyword-matching issue
+  above) and an outright skip when there are zero articles to analyze. The
+  formula can't currently distinguish "real neutral signal" from "no signal
+  at all."
+- `filing_contribution` is always 0.0 right now, since `FilingSceptic` always
+  skips its LLM call until PUCARS scraping (see Announcement scraping issue
+  above) produces real filing text for any ticker.
+- `ml_contribution` is hardcoded to 0.0 — Phase 3 hasn't been built yet (see
+  ML model contribution issue below).
+
+**Expected to ease once:** Phase 3's ML signal goes live (gives a second
+consistently-nonzero term) and/or PUCARS scraping produces real filing data
+(lets `filing_contribution` actually vary). Flagging this now so a clustered
+58.5-ish score across many tickers isn't mistaken for a future regression —
+it's the expected output of the current formula with two of its four terms
+structurally pinned to zero.
+
 ---
 
 ## Resolved

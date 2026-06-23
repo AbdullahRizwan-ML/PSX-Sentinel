@@ -79,19 +79,25 @@ async def _run_analysis_async(ticker: str) -> dict:
     Async implementation of the analysis pipeline.
 
     Creates its own DB session isolated from the FastAPI request
-    lifecycle. Runs the full data pipeline for a single ticker,
+    lifecycle. Runs the 4-agent orchestrator for a single ticker,
     then cleans up the Redis analysis lock.
     """
-    from app.collectors.pipeline import run_full_pipeline
+    from app.agents.orchestrator import AnalysisOrchestrator
     from app.core.redis_client import redis_client
     from app.db.session import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
         try:
-            result = await run_full_pipeline(db, tickers=[ticker])
-            return result
+            orchestrator = AnalysisOrchestrator(db)
+            analysis = await orchestrator.analyze(ticker)
+            await db.commit()
+            report = analysis["report"]
+            return {
+                "ticker": ticker,
+                "conviction_score": report.conviction_score,
+                "technical_signal": report.technical_signal,
+            }
         finally:
-            # Clean up the analysis lock
             await redis_client.delete_cached(
                 f"analysis_running:{ticker}"
             )
