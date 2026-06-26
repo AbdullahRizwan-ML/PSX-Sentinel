@@ -547,4 +547,204 @@ the +6pp accuracy edge is too thin to bet on for actionable signals.
   or to compute features on the in-memory price list directly. Flagged
   but explicitly out of scope for this session.
 
+## 2026-06-27 — Phase 3 Session 3 built: ml_contribution wired into Arbitrator (confidence-gated, 5% weight)
+
+Built via Claude Code (Opus 4.7 session). Wires the trained XGBoost
+model into the Arbitrator's conviction score, with a confidence gate
+and a small weight matching Session 2's recommendation. The
+Arbitrator is no longer hard-coding `ml_contribution=0.0`.
+
+**Files created/modified (exact list):**
+- New: `backend/app/ml/inference.py` — module-level lazy-loaded
+  XGBoost singleton, `predict_from_prices(prices, threshold)` returning
+  a rich result dict (`available`, `gate_passed`, `skip_reason`,
+  `predicted_class`, `max_prob`, `probabilities`, `as_of_date`,
+  `confidence_threshold`). Never raises — degradation is signalled via
+  `available=False` + a `skip_reason` string.
+- New: `backend/scripts/probe_ml_signal.py` — read-only diagnostic
+  that runs predict_from_prices over every ticker in the DB. No LLM
+  calls, no writes. Useful for "is the gate doing anything?"
+  inspection at any future point.
+- New: `backend/scripts/verify_ml_wiring.py` — live verification
+  script. 4 parts: probe / production run / gate-pass demo (lowers
+  threshold to 0.35 in-process and restores it on the way out) /
+  direct SQL dump of the persisted score_breakdown.
+- Modified: `backend/app/ml/features.py` — extracted
+  `_compute_indicators(df)` from the existing batch path so the new
+  point-in-time builder can share the exact same per-feature math.
+  Added `build_features_point_in_time(prices) -> dict | None` for
+  live inference: returns the latest row's 11-feature vector or
+  `None` if there's not enough trailing history (binding constraint
+  remains RANGE_52W = 252 trading days). Batch output is unchanged —
+  validated by running the refactored `build_features` on a synthetic
+  series and confirming `build_features_point_in_time(prices.iloc[:-5])`
+  matches the last row of `build_features(prices)` exactly.
+- Modified: `backend/app/agents/base.py` — added `ml_signal: dict = {}`
+  field on `AgentContext` so the orchestrator can attach the ML
+  result before the Arbitrator runs. No other agents read this
+  field; only Arbitrator does.
+- Modified: `backend/app/agents/arbitrator.py` — added `ML_MAGNITUDE`
+  (5.0), `ML_GATE` (0.55), `ML_DIRECTION` ({UP:+1,DOWN:-1,FLAT:0})
+  class constants. Added `_ml_contribution(ml_signal)` that returns
+  0.0 unless `gate_passed` is True. Replaced the inline
+  `score_breakdown` literal with `_build_score_breakdown(...)`, which
+  now emits an `ml_detail` sub-dict (predicted_class, max_prob,
+  per-class probabilities, gate_passed, skip_reason,
+  confidence_threshold, as_of_date, magnitude_points, model_caveat
+  string) so the persisted report distinguishes "real bullish
+  signal" from "model unavailable" from "below confidence threshold"
+  — closing one of the open issues from Session 2. Reworked
+  `_build_prompt` to take `ml_signal` and call a new
+  `_render_ml_block(ml_signal)` helper that adds a clearly-labeled ML
+  section to the LLM narrative prompt, with an explicit caveat
+  (~6pp over random, never predicts FLAT, treat as minor input)
+  baked into the prompt so the generated bull/bear case doesn't
+  overstate it.
+- Modified: `backend/app/agents/orchestrator.py` — extended price
+  pull window from 365 → 600 calendar days (constant
+  `PRICE_WINDOW_DAYS`) so the 252-trading-day position_52w lookback
+  has real margin. Added a `predict_from_prices` call before the
+  agents run, attaching the result to `context.ml_signal`. Populates
+  `report.ml_beat_probability` with the UP-class probability
+  (repurposing the legacy schema field name; documented inline). The
+  inference call is intentionally inline-synchronous: model is
+  cached at module level after the first call, so it's a microsecond
+  numpy op — no asyncio.to_thread wrapping needed.
+
+**Protected files (untouched, confirmed):** `trend_analyzer.py`,
+`news_synthesizer.py`, `filing_skeptic.py` — none modified this
+session. The four-agent design contract is preserved.
+
+**Shared feature math (per prompt requirement, no duplication):** The
+point-in-time path and the batch path both go through
+`_compute_indicators()`. Verified by running batch on a synthetic
+600-row series and confirming `build_features_point_in_time(prices[:-5])`
+produces a feature vector identical to `build_features(prices).iloc[-1]`
+(np.isclose across all 11 features). Two different consumers, one
+implementation of MA/RSI/momentum/etc. — exactly what training-vs-
+inference parity requires.
+
+**Weight + gate logic (final):**
+- `ML_MAGNITUDE = 5.0` (5% max swing on the 0-100 score) — down from
+  the originally-reserved 15%, per the Session 2 recommendation.
+- `ML_GATE = 0.55` (strict `>`, not `>=`) on `max(predict_proba)`.
+- When the gate fails OR the model is unavailable OR there's
+  insufficient history, `ml_contribution = 0.0` AND the report's
+  `ml_detail.skip_reason` records which of those three cases
+  occurred. Other scoring weights (technical, news, filing) were NOT
+  modified — they retain their original Session 2 magnitudes
+  (max ±20, ±15, -5/-15/-30 respectively), and the base of 50 is
+  unchanged. Clamp `[0, 100]` still applied after summing.
+
+**Live verification — Part A (probe over all 10 tickers):**
+
+| Ticker | Rows | Class | max_prob | Gate | Reason |
+|---|---:|---|---:|---|---|
+| ENGRO | 44 | — | — | fail | insufficient_history |
+| HBL | 396 | UP | 0.399 | fail | below_confidence_threshold |
+| LUCK | 391 | UP | 0.404 | fail | below_confidence_threshold |
+| MARI | 396 | DOWN | 0.362 | fail | below_confidence_threshold |
+| MCB | 396 | UP | 0.357 | fail | below_confidence_threshold |
+| MEBL | 396 | UP | 0.374 | fail | below_confidence_threshold |
+| OGDC | 396 | DOWN | 0.392 | fail | below_confidence_threshold |
+| PPL | 396 | UP | 0.400 | fail | below_confidence_threshold |
+| PSO | 396 | DOWN | 0.378 | fail | below_confidence_threshold |
+| UBL | 396 | UP | 0.407 | fail | below_confidence_threshold |
+
+All 10 tickers' top-class probability lies in [0.357, 0.407] — none
+clear the 0.55 production gate. This reproduces the Session 2
+test-set finding directly in live production: 9/10 predict UP or
+DOWN (never FLAT — model is structurally FLAT-blind here too), and
+the model is genuinely not confident on any of them. The gate is
+behaving as designed: silence rather than a weak vote. ENGRO's
+"insufficient_history" matches the existing Known Issue (ENGRO has
+~887 raw rows vs ~1,238 for the other 9; the 600-day pull window
+captures only 44 of those since the missing range is recent —
+flagging this is a fresh diagnostic data point for that backfill
+follow-up).
+
+**Live verification — Part B (production run, real ML_GATE = 0.55,
+2026-06-27, direct from `intelligence_reports`):**
+
+| Ticker | conviction | tech | news | filing | ml | ml_beat_prob | predicted | max_prob |
+|---|---:|---:|---:|---:|---:|---:|---|---:|
+| PPL | 58.5 | 8.5 | 0.0 | 0.0 | 0.0 | 0.400 | UP | 0.400 |
+| MCB | 58.5 | 8.5 | 0.0 | 0.0 | 0.0 | 0.357 | UP | 0.357 |
+| UBL | 58.5 | 8.5 | 0.0 | 0.0 | 0.0 | 0.407 | UP | 0.407 |
+
+Hand-check (PPL): 50 + 8.5 (tech BUY × 0.85) + 0 + 0 + 0 = 58.5 ✓.
+Same arithmetic holds for MCB and UBL (trend agent returned BUY for
+all three this run; tech×conf identical at 8.5; sum 58.5).
+
+**Are PPL and MCB conviction scores now different?** No — both
+remain 58.5. This was explicitly anticipated in the Session 3
+prompt's verification section ("explain clearly if they're still
+identical and why (e.g. both might still land below the confidence
+gate)"). They DO now differ in the persisted report in three
+material ways even though `conviction_score` doesn't:
+1. `ml_beat_probability` (a top-level column on
+   `intelligence_reports`) is 0.400 for PPL vs 0.357 for MCB.
+2. `score_breakdown.ml_detail.max_prob`, `.predicted_class`, and
+   `.probabilities` differ row-by-row.
+3. `score_breakdown.ml_detail.skip_reason = "below_confidence_threshold"`
+   makes the zero contribution self-explanatory in the persisted
+   data — no consumer has to guess "why is this zero?"
+
+The conviction-score collision is the *correct* production behavior
+of the chosen design: weak ML signals shouldn't move the score, and
+right now no ticker's signal is strong enough to qualify. If/when
+the model ever does clear 0.55 on a ticker (e.g. after retraining
+with more features or after adding to the ticker universe), the
+scores will diverge naturally.
+
+**Live verification — Part C (gate-pass code path, ML_GATE
+temporarily lowered to 0.35 in-process for one call on UBL):**
+
+| Ticker | conviction | tech | news | filing | ml | gate_passed | predicted |
+|---|---:|---:|---:|---:|---:|---|---|
+| UBL (demo) | 55.0 | 0.0 | 0.0 | 0.0 | 5.0 | true | UP |
+
+Hand-check: 50 + 0 (tech NEUTRAL this run) + 0 + 0 + 5 (UP × +1 ×
+5.0 magnitude) = 55.0 ✓. The trend agent's LLM response for this
+particular run came back NEUTRAL (different from the production
+BUY moments earlier — same temperature=0.1 stochasticity already
+present in the system, not new), which is why `technical_contribution`
+is 0 here. The ML term contributing +5 exactly as predicted by the
+hand-math confirms the gate-pass code path is wired correctly.
+`Arbitrator.ML_GATE` was restored to 0.55 immediately after this
+call; the production constant in the source file was never
+changed.
+
+**Live verification — Part D (SQL dump confirms persistence):**
+`score_breakdown.ml_detail` is present and fully populated on the
+five new `intelligence_reports` rows written this session. The
+earlier MCB row from Session 2 (predates this change) has the
+simple `ml_contribution: 0.0` without an `ml_detail` block — no
+backfill needed since the field is purely additive metadata.
+
+**Judgment calls / deviations from the prompt:**
+- The prompt asked for verification that "ml_contribution is nonzero
+  for at least one ticker where the model's confidence clears 0.55."
+  In current data NO real ticker clears 0.55 — exercised the gate-pass
+  code path via the in-process threshold demo (Part C) rather than
+  contriving a synthetic ticker or lowering the production gate, since
+  the prompt also explicitly allowed "explain clearly if they're still
+  identical and why." Both reads of the prompt are satisfied.
+- `ml_beat_probability` (legacy schema field designed for the original
+  earnings-beat target before that target was redefined in Session 1)
+  is repurposed to hold the UP-class probability. Inline comment in
+  `orchestrator.py` documents the rename rather than changing the
+  database schema, since renaming a column would have required an
+  Alembic migration and was outside this session's scope. The
+  semantic is consistent: "estimated probability of a > +1% move
+  over the next 5 trading days" is the natural successor to "estimated
+  probability of an earnings beat" for this purpose.
+- Added an `ml_detail.model_caveat` string into the persisted score
+  breakdown, so the weak-signal warning is durable in the database,
+  not just in the LLM prompt. Cheap and useful for any future UI that
+  renders the breakdown — surfaces the caveat without the consumer
+  having to know the model's history. This is mild scope creep over
+  what the prompt strictly required but matches the prompt's "Visible
+  low-confidence labeling (do this, it's expected practice)" spirit.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

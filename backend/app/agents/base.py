@@ -61,6 +61,14 @@ class AgentContext(BaseModel):
     news_sentiment: dict = {}
     filing_flags: dict = {}
 
+    # Populated by the orchestrator (NOT an LLM agent) before Agent 4
+    # runs. Comes from app.ml.inference.predict_from_prices over
+    # recent_prices — a deterministic XGBoost call, not a sub-agent.
+    # See app/ml/inference.py for the dict shape; consumers should
+    # read it via dict.get() to remain safe when the model is
+    # unavailable (legacy reports, missing model.json, etc.).
+    ml_signal: dict = {}
+
 
 class AgentResult(BaseModel):
     """

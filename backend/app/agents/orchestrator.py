@@ -38,6 +38,15 @@ from app.db.models import (
     IntelligenceReport,
     NewsArticle,
 )
+from app.ml.inference import predict_from_prices
+
+# Calendar-day window for the price pull. The point-in-time ML feature
+# builder needs RANGE_52W=252 TRADING days for position_52w; with
+# weekends + PSX holidays that maps to ~365 calendar days at the
+# margin. We pull 600 to give the latest row real margin (a few months
+# of data above the binding constraint), which also lets TrendAnalyzer
+# work from a richer-than-before history. Pre-Session-3 this was 365.
+PRICE_WINDOW_DAYS = 600
 
 
 class AnalysisOrchestrator:
@@ -74,6 +83,14 @@ class AnalysisOrchestrator:
             ticker, company.name, str(report_id)
         )
 
+        # Compute the point-in-time ML price-direction signal
+        # synchronously. predict_from_prices loads model.json once at
+        # module level, then this call is a microsecond numpy op — fine
+        # to call inline in the async request path without
+        # asyncio.to_thread. It never raises (it returns a structured
+        # skip dict on any failure), so we don't wrap in try/except.
+        context.ml_signal = predict_from_prices(context.recent_prices)
+
         llm = LLMGateway(db=self.db, redis=redis_client)
 
         trend_agent = TrendAnalyzer(llm=llm, db=self.db)
@@ -85,7 +102,11 @@ class AnalysisOrchestrator:
             f"Running analysis for {ticker}: "
             f"{len(context.recent_prices)} prices, "
             f"{len(context.news_articles)} articles, "
-            f"{len(context.announcements)} announcements"
+            f"{len(context.announcements)} announcements, "
+            f"ml_signal=available={context.ml_signal.get('available')} "
+            f"gate={context.ml_signal.get('gate_passed')} "
+            f"class={context.ml_signal.get('predicted_class')} "
+            f"p={context.ml_signal.get('max_prob')}"
         )
 
         trend_result = await trend_agent.run_safe(context)
@@ -116,6 +137,15 @@ class AnalysisOrchestrator:
         report.technical_signal = arb_output.get(
             "technical_signal", "NEUTRAL"
         )
+        # ml_beat_probability is a legacy field name from the original
+        # earnings-beat design (Phase 1A schema, before the target was
+        # redefined in Phase 3 Session 1 to 5-day price direction). We
+        # repurpose it for the UP-class probability so the existing
+        # field stays useful: a number in [0, 1] that means
+        # "model-estimated probability of a >+1% move over the next 5
+        # trading days." Stays 0.0 when the ML signal is unavailable.
+        probs = (context.ml_signal or {}).get("probabilities") or {}
+        report.ml_beat_probability = float(probs.get("UP", 0.0))
         report.bull_case = arb_output.get(
             "bull_case", "Analysis incomplete."
         )
@@ -173,7 +203,7 @@ class AnalysisOrchestrator:
     async def _build_context(
         self, ticker: str, company_name: str, analysis_id: str
     ) -> AgentContext:
-        cutoff_price = date.today() - timedelta(days=365)
+        cutoff_price = date.today() - timedelta(days=PRICE_WINDOW_DAYS)
         price_result = await self.db.execute(
             select(DailyPrice)
             .where(

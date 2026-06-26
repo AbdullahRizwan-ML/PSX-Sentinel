@@ -68,15 +68,6 @@ commercial API — no visible self-serve signup or free-tier key.
 moves toward having real paying subscribers, at which point a commercial data 
 contract makes more sense anyway.
 
-### ML model contribution to Arbitrator score is a placeholder
-
-The `Arbitrator` agent's weighted scoring formula (Phase 2B) reserves a 15% 
-weight slot for an ML earnings-prediction signal, but Phase 3 (the actual 
-XGBoost/LightGBM model, adapted from EarningsPulse) hasn't been built yet. 
-Until then, that term contributes 0 to the score — the formula is structured 
-to make plugging it in later straightforward, but the conviction scores 
-produced by Phase 2B alone are necessarily incomplete.
-
 ### Conviction scores currently cluster near 50-60 for most tickers
 
 Live verification of Phase 2B Session 2's `AnalysisOrchestrator` (see Build
@@ -98,15 +89,27 @@ consistently nonzero, because:
 - `filing_contribution` is always 0.0 right now, since `FilingSceptic` always
   skips its LLM call until PUCARS scraping (see Announcement scraping issue
   above) produces real filing text for any ticker.
-- `ml_contribution` is hardcoded to 0.0 — Phase 3 hasn't been built yet (see
-  ML model contribution issue below).
+- `ml_contribution` is wired (Phase 3 Session 3, 2026-06-27) but
+  currently always 0.0 in production because no ticker's max
+  `predict_proba` clears the 0.55 confidence gate. The Session 2
+  evaluation already foreshadowed this (model accuracy +6pp over
+  random, structurally FLAT-blind), and live production confirms it:
+  all 10 tickers' top-class probability is in [0.357, 0.407]. This is
+  the *designed* behavior of the gate — silence rather than a weak
+  vote — not a defect. `score_breakdown.ml_detail` records the gate
+  status, predicted class, and per-class probabilities even when
+  `ml_contribution=0`, so downstream consumers can distinguish "below
+  gate" from "model unavailable" from "insufficient history". Until
+  the model is retrained on a stronger feature set or class-balanced
+  better, expect this term to keep contributing 0 in production.
 
-**Expected to ease once:** Phase 3's ML signal goes live (gives a second
-consistently-nonzero term) and/or PUCARS scraping produces real filing data
-(lets `filing_contribution` actually vary). Flagging this now so a clustered
-58.5-ish score across many tickers isn't mistaken for a future regression —
-it's the expected output of the current formula with two of its four terms
-structurally pinned to zero.
+**Expected to ease once:** PUCARS scraping produces real filing data
+(lets `filing_contribution` actually vary), and/or a future ML
+retraining lifts at least some tickers past the 0.55 gate. Flagging
+this now so a clustered 58.5-ish score across many tickers isn't
+mistaken for a future regression — it's the expected output of the
+current formula with two of its four terms still structurally pinned
+to zero (filing always, ML almost always).
 
 ### ENGRO has shorter price history than other tickers
 
