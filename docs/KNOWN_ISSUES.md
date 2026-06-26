@@ -127,29 +127,48 @@ ENGRO-specific model evaluation less reliable than for other tickers.
 for ENGRO against the PSX DPS endpoint to backfill the missing date range,
 then re-verify row count via direct SQL before rebuilding the ML dataset.
 
-### Suspected unadjusted stock-split row in daily_prices
-
-One row produced a ~-88% forward 5-day return in the Phase 3 Session 1
-dataset build (2026-06-27) — almost certainly a stock split that wasn't
-adjusted for in the underlying price series, not a real market move.
-
-**Not yet identified:** which ticker/date this is. Not yet fixed.
-
-**Important:** an unadjusted split would corrupt more than just that one
-forward-return label — it would also distort `return_1m`/`return_3m`/moving
-averages for that ticker in the weeks surrounding the split date, since
-those features look backward across the same discontinuity.
-
-**Suggested fix (Phase 3 Session 2 or a dedicated data-quality pass):**
-identify the exact ticker/date via a query for extreme single-day or 5-day
-returns across `daily_prices`, confirm whether it's a real split via a
-news/filing search, and either apply a split adjustment to the price series
-or explicitly filter/winsorize the affected window — don't just clip the one
-extreme label and leave the upstream features contaminated.
-
 ---
 
 ## Resolved
+
+### Unadjusted stock-split rows in daily_prices — RESOLVED 2026-06-27
+
+**Was:** One row produced a ~-88% forward 5-day return in the Phase 3
+Session 1 dataset build. Cause: stock splits / face-value reductions are
+not applied in PSX DPS raw close prices.
+
+**Fix (Phase 3 Session 2):** A diagnostic pass over the live DB
+(`backend/scripts/find_split_row.py`) identified three split-shaped
+overnight gaps:
+
+| Ticker | Effective date | Pre-split close | Post-split close | Empirical ratio |
+|---|---|---|---|---|
+| MARI | 2024-09-16 | 3560.00 | 415.90 | 8.5597 (likely 10:1) |
+| LUCK | 2025-04-28 | 1748.80 | 365.00 | 4.7912 (likely 5:1) |
+| UBL  | 2025-06-23 | 522.79  | 259.99 | 2.0108 (clean 2:1) |
+
+All three were confirmed as splits, not market moves, by the dollar-volume
+preservation signature (post-split day's `close × volume` ≈ pre-split day's
+`close × volume`), the absence of any matching bad-news article in
+`news_articles`, and the fact that no other near-comparable single-day
+drops exist in the entire 12k-row history (next-worst non-split drop is
+-25%, well below the -50%/-80%/-88% split signatures).
+
+The fix is a backward-adjustment table in
+`backend/app/ml/split_adjustments.py`. The ML dataset builder applies it
+before the feature build, dividing pre-split open/high/low/close by the
+empirical ratio and multiplying volume by it. Empirical (not clean) ratios
+are used so the post-adjustment series is exactly continuous across the
+split day — see the module docstring for the trade-off discussion (cost:
+any genuine same-day movement on the split day is absorbed into the
+adjustment factor; for MARI that's ~+17% absorbed, LUCK ~-4%, UBL ~0%).
+
+Verified post-fix (`backend/scripts/verify_dataset.py`): worst
+`forward_return_5d` in the entire labeled dataset is now -25.4% (OGDC,
+2024-02-12 — a genuine bad-news day), no more -50% to -88% rows. The
+per-ticker chronological-split invariant still holds for all 10 tickers.
+Row counts unchanged from Session 1 (train 6621 / val 1418 / test 1426),
+class distributions shifted by ≤0.4pp.
 
 ### yfinance — RESOLVED 2026-06-08 (removed permanently)
 

@@ -373,4 +373,178 @@ Neither blocks this session's deliverable; both are flagged for follow-up.
 engineering and dataset-splitting only — no `xgboost`, `lightgbm`, or
 `sklearn` imports, no `.fit()` calls anywhere in either file.
 
+## 2026-06-27 — Phase 3 Session 2 built: split-fix + XGBoost trained/evaluated
+
+Built via Claude Code (Opus 4.7 session). Two parts, in order.
+
+**Files created/modified:**
+- New: `backend/app/ml/split_adjustments.py` — corporate-action adjustment
+  table + `apply_split_adjustments()` helper.
+- New: `backend/scripts/find_split_row.py` — read-only diagnostic that
+  prints top-15 extreme single-day and 5-day returns across all tickers.
+- New: `backend/scripts/verify_dataset.py` — read-only sanity check on
+  post-fix parquet files (most-extreme returns, per-ticker chronological
+  invariant).
+- New: `backend/scripts/train_ml_model.py` — XGBoost trainer + evaluator,
+  saves `ml_data/model.json` and `ml_data/metrics.json`.
+- Modified: `backend/scripts/build_ml_dataset.py` — calls
+  `apply_split_adjustments(prices, ticker)` between the DB pull and
+  `build_features()`. Single insertion, no other logic touched.
+
+**None of the four agent files or `orchestrator.py` were touched —
+confirmed via `git status` (only `backend/scripts/build_ml_dataset.py`
+modified, the rest untracked new files).**
+
+### Part 1 — Split-adjustment fix
+
+`find_split_row.py` against the live DB identified three split-shaped
+overnight gaps. All three confirmed as real splits by the dollar-volume
+preservation signature (post-split `close × volume` ≈ pre-split
+`close × volume`), absence of any matching bad-news article in
+`news_articles`, and the fact that the next-worst non-split single-day
+drop in the entire 12k-row dataset is only -19% — splits are cleanly
+separated from real market moves.
+
+| Ticker | Date | Pre-close | Post-close | Empirical ratio |
+|---|---|---|---|---|
+| MARI | 2024-09-16 | 3560.00 | 415.90 | 8.5597 |
+| LUCK | 2025-04-28 | 1748.80 | 365.00 | 4.7912 |
+| UBL  | 2025-06-23 | 522.79  | 259.99 | 2.0108 |
+
+**Approach chosen: backward adjustment with empirical ratios** (not clean
+ratios, not window-drop, not label-clip). The pre-split open/high/low/close
+get divided by the ratio and pre-split volume gets multiplied by it. This
+restores continuity to the price series so every backward-looking feature
+(MA20, MA50, RSI14, return_1m, return_3m, volatility_20d, position_52w)
+works correctly across the split boundary without any window drops.
+Trade-off documented in `split_adjustments.py`: empirical ratios absorb
+any genuine same-day market move on the split day into the adjustment
+factor (MARI ~+17% absorbed, LUCK ~-4%, UBL ~0%). Window-drop was
+rejected — losing ~252 post-split days per affected ticker would have
+gutted the dataset.
+
+**Before/after row counts** (Session 1 → Session 2): identical at
+6,621 / 1,418 / 1,426 (train/val/test). The fix doesn't change which rows
+have valid forward windows; it just gives the previously-contaminated
+rows correct labels.
+
+**Before/after class distributions** (Session 1 → Session 2, train split):
+UP 40.9% → 41.0%, DOWN 36.6% → 36.5%, FLAT 22.5% → 22.5%. Shifts ≤0.4pp
+in every cell of every split. No class drops below 20%.
+
+**Verified post-fix:** worst `forward_return_5d` in the labeled dataset
+is now -25.4% (OGDC, 2024-02-12 — a genuine bad-news day), with no rows
+worse than that. The previous -88%/-79%/-50% split-induced outliers are
+gone. Per-ticker chronological-split invariant
+(`train_max < val_min < val_max < test_min`) still holds for all 10
+tickers. Both verifications run from `verify_dataset.py`.
+
+### Part 2 — XGBoost training + evaluation
+
+**Model:** `xgb.XGBClassifier(objective="multi:softprob", num_class=3,
+n_estimators=800, max_depth=4, learning_rate=0.05, subsample=0.8,
+colsample_bytree=0.8, reg_lambda=1.0, min_child_weight=5,
+tree_method="hist", early_stopping_rounds=30)` with eval set = val split.
+**Random seed: 42** (set on numpy, on the trainer, and on the train-only
+shuffle).
+
+**Best iteration on val: 27 of 800.** Early stopping kicked in fast —
+the model essentially extracts what little signal exists in the first
+~30 trees and then val loss plateaus.
+
+**Test-set metrics (final reported, never used for tuning):**
+
+```
+Accuracy: 0.3934   (random-chance baseline = 0.3333)
+
+              precision    recall  f1-score   support
+        DOWN     0.3655    0.1631    0.2255       558
+        FLAT     0.0000    0.0000    0.0000       294
+          UP     0.3993    0.8188    0.5368       574
+    accuracy                         0.3934      1426
+
+Confusion matrix (rows = actual, cols = predicted):
+                DOWN     FLAT       UP
+  DOWN            91        0      467
+  FLAT            54        0      240
+  UP             104        0      470
+
+Test prediction distribution:
+  DOWN :   249  (17.5%)
+  FLAT :     0  ( 0.0%)
+  UP   :  1177  (82.5%)
+```
+
+**Feature importances (gain):** `price_vs_ma20` (0.113), `position_52w`
+(0.111), `volume_vs_avg20` (0.101), `return_3m` (0.093), `ma_50` (0.093),
+`rsi_14` (0.089), `price_vs_ma50` (0.086), `return_1w` (0.082),
+`volatility_20d` (0.082), `ma_20` (0.079), `return_1m` (0.072).
+Importances are quite flat (range 0.07–0.11) — no single feature dominates,
+which is consistent with there being little signal overall rather than one
+strong predictor.
+
+### Explicit leakage self-check (run despite the result not being
+suspiciously high)
+
+1. **`close`, `date`, `ticker` excluded as model features.** ✓ Confirmed
+   by inspecting `FEATURE_COLUMNS` in `app/ml/features.py` — contains
+   exactly the 11 features listed above, none of `close`/`date`/`ticker`/
+   `label`/`forward_return_5d`. The training script's `_xy()` only takes
+   `df[FEATURE_COLUMNS]` so it cannot accidentally include anything else.
+2. **Per-ticker chronological invariant holds post-fix.** ✓ Already
+   verified by `verify_dataset.py` above — all 10 tickers pass
+   `train_max < val_min < val_max < test_min`.
+3. **`forward_return_5d` not in feature columns.** ✓ Same source as
+   check 1.
+
+### Honest verdict (the read for Session 3)
+
+39.34% accuracy is a real but **very weak** edge (~+6pp over random
+chance on a 3-class problem). The model has structurally collapsed on
+the FLAT class — it makes zero FLAT predictions on the test set, and
+its UP-precision (40%) only barely beats the UP base rate (40.3%).
+Effectively it's a noisy binary UP/DOWN classifier that happens to
+weight UP heavily because UP is the majority class.
+
+This is the kind of result the Session 2 prompt explicitly warned about
+and asked us to report plainly rather than dress up. Technical features
+on 10 PSX tickers with no fundamentals, no order-flow, no filing data —
+this is roughly the upper bound of what this feature set can do.
+
+**Recommendation for Session 3 (Arbitrator wiring):** wire
+`ml_contribution` in, but with **substantially less weight than the 15%
+slot reserved in the original formula**. Defensible options:
+- Drop weight to 5%, and only let it contribute when the predicted class
+  has probability > 0.55 (i.e. treat low-confidence predictions as null).
+- Or treat it as a tiebreaker only — apply it only when
+  `technical_contribution + news_contribution + filing_contribution`
+  produces a near-50 conviction score.
+
+Either way, do not let this model materially move conviction scores —
+the +6pp accuracy edge is too thin to bet on for actionable signals.
+
+### What Session 3 will need from this session
+
+- Model file: `backend/ml_data/model.json` (gitignored; XGBoost native
+  format). Load with:
+  ```python
+  import xgboost as xgb
+  model = xgb.XGBClassifier()
+  model.load_model("backend/ml_data/model.json")
+  ```
+- Metrics file (for any "show what the model is calibrated to" UI):
+  `backend/ml_data/metrics.json`.
+- Inference shape: input is a 1-D numpy array of length 11, ordered
+  exactly as `app.ml.features.FEATURE_COLUMNS`. `model.predict(x)`
+  returns class id (0=DOWN, 1=FLAT, 2=UP); `model.predict_proba(x)`
+  returns shape (n, 3) probabilities in that class order.
+- Live inference still needs a feature-build helper that takes the
+  current point-in-time price series and returns the same 11-feature
+  vector — `app/ml/features.build_features()` is batch-only, returns a
+  DataFrame, and requires both a lookback AND a forward window (it will
+  drop the very latest row because there's no `forward_return_5d` yet).
+  Session 3 will need a small `build_features_point_in_time()` variant
+  or to compute features on the in-memory price list directly. Flagged
+  but explicitly out of scope for this session.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

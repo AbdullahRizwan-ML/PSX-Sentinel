@@ -102,8 +102,20 @@ async def main() -> None:
     from app.core.config import get_settings
     from app.db.session import AsyncSessionLocal
     from app.ml.features import build_features
+    from app.ml.split_adjustments import (
+        SPLIT_ADJUSTMENTS,
+        apply_split_adjustments,
+    )
 
     tickers = get_settings().tickers_list
+
+    if SPLIT_ADJUSTMENTS:
+        logger.info(
+            "Applying {} split adjustment(s) before feature build:",
+            len(SPLIT_ADJUSTMENTS),
+        )
+        for t, d, r in SPLIT_ADJUSTMENTS:
+            logger.info(f"  {t} on {d}: ratio={r:.4f}")
     logger.info(
         f"Building ML dataset for {len(tickers)} tickers: {tickers}"
     )
@@ -138,6 +150,7 @@ async def main() -> None:
                 }
                 continue
 
+            prices = apply_split_adjustments(prices, ticker)
             labeled = build_features(prices, ticker=ticker)
             n_labeled = len(labeled)
             dropped_total += n_raw - n_labeled
