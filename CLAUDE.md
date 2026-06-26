@@ -10,10 +10,13 @@
 ## What this is
 
 Enterprise-grade AI financial intelligence platform for the Pakistan Stock 
-Exchange (PSX). Combines an ML earnings prediction model with a 4-agent 
-autonomous research pipeline. This is a portfolio and career-leverage project 
-for a final-year Data Science student — it must read as production quality 
-to recruiters and technical interviewers, not as a student project.
+Exchange (PSX). Combines an ML price-direction prediction model with a 
+4-agent autonomous research pipeline. (Originally scoped as an earnings 
+surprise model — rejected in Phase 3 Session 1, 2026-06-27, since the 
+project has no reported-EPS/consensus-estimate data source; see Build Log.) 
+This is a portfolio and career-leverage project for a final-year Data 
+Science student — it must read as production quality to recruiters and 
+technical interviewers, not as a student project.
 
 Name: **PSX Sentinel**. Repository: `github.com/AbdullahRizwan-ML/psx-sentinel`
 
@@ -49,7 +52,8 @@ Name: **PSX Sentinel**. Repository: `github.com/AbdullahRizwan-ML/psx-sentinel`
 - [x] **Phase 2A** — Data collectors: `BaseCollector` pattern, company seed data (10 KSE-30 tickers), price collector (PSX DPS), announcement collector (currently returns 0 — portal is JS-rendered), news collector (ARY News RSS), PDF parser (idle — nothing to parse yet), pipeline orchestrator, standalone CLI runner script. **Fixed and verified** after initial yfinance/RSS failures (see Build Log, May 30 – June 8).
 - [x] **Phase 2B Session 1** — Four specialist agents built: `TrendAnalyzer`, `NewsSynthesizer`, `FilingSceptic`, `Arbitrator` (`backend/app/agents/`). All inherit `BaseAgent` correctly, all LLM calls go through `self.llm.complete()`, syntax-verified via `ast.parse()`. **Not yet verified end-to-end** — no orchestrator exists yet to actually run them against live data, so behavior at runtime is unconfirmed.
 - [x] **Phase 2B Session 2** — `AnalysisOrchestrator` (`backend/app/agents/orchestrator.py`) wires the four agents together: builds `AgentContext` from the live database, runs `TrendAnalyzer`/`NewsSynthesizer`/`FilingSceptic` via `run_safe()`, feeds their output into `Arbitrator`, persists a real `IntelligenceReport`. Wired into both `POST /companies/{ticker}/analyze` (now runs inline and returns the saved report directly) and the Celery `run_analysis` task. **Live-verified** against 2 real tickers (PPL, MCB) — confirmed via direct SQL against `intelligence_reports` and `llm_calls` (not log output): 2 new report rows, 5 new `llm_calls` rows across Groq llama-3.3-70b-versatile, correct LLM skips for `FilingSceptic` (both tickers, 0 calls) and `NewsSynthesizer` (MCB only, 0 articles). None of the four agent files were modified during this session. See Build Log, 2026-06-23 (Session 2 entry) for full detail.
-- [ ] **Phase 3** — ML pipeline: XGBoost + LightGBM earnings/price-movement prediction, adapted from the existing EarningsPulse architecture, retrained on PSX data. Feeds a probability score into the Arbitrator's conviction score calculation (currently a 0%-weighted placeholder in the scoring formula).
+- [x] **Phase 3 Session 1** — ML feature pipeline + labeled dataset (no training yet). Target redefined from earnings surprise to 5-trading-day-ahead price direction (UP/DOWN/FLAT, ±1% flat band) — no EPS/consensus data exists in this project, and the target uses only the already-confirmed-live `daily_prices` data. `backend/app/ml/features.py` computes MA20/MA50/RSI(14)/momentum/volume-trend/volatility/52w-range-position per ticker; `backend/scripts/build_ml_dataset.py` pulls all 10 tickers' price history from the live DB, builds features, and writes a per-ticker chronological 70/15/15 train/val/test split to `backend/ml_data/*.parquet` (gitignored — local training artifact, not application state, not in Postgres). **Live-verified:** 12,025 raw `daily_prices` rows read, 2,560 dropped for insufficient lookback/forward window, 9,465 labeled rows (train 6,621 / val 1,418 / test 1,426), class balance checked per split (no class below 20%), and a no-leakage invariant (`train_max_date < val_min_date < val_max_date < test_min_date`) confirmed per ticker directly against the output files. Two new data-quality issues filed (see Known Issues): ENGRO's shorter history, one suspected unadjusted stock-split row.
+- [ ] **Phase 3 Session 2** — Train XGBoost/LightGBM on the Session 1 dataset, evaluate, and wire the resulting probability into the Arbitrator's `ml_contribution` term (currently a 0%-weighted placeholder in the scoring formula).
 - [ ] **Phase 4** — Next.js 15 frontend (dashboard, company pages, watchlist, alerts UI).
 - [ ] **Future / deferred** — Playwright-based PUCARS announcement/PDF scraper; possible CapitalStake integration if productized; possible additional news sources (Dunya News website scraping, since their RSS is blocked but the site itself loads).
 
@@ -90,6 +94,8 @@ Name: **PSX Sentinel**. Repository: `github.com/AbdullahRizwan-ML/psx-sentinel`
 | `backend/scripts/run_pipeline.py` | Standalone CLI runner for manual pipeline testing (`--seed-only`, `--tickers X,Y`) |
 | `backend/scripts/diagnose_sources.py` | Diagnostic script that tests each external data source without touching the DB |
 | `backend/scripts/test_analysis.py` | Standalone verification script for `AnalysisOrchestrator` — runs real tickers and queries `intelligence_reports`/`llm_calls` directly to confirm persistence |
+| `backend/app/ml/features.py` | Phase 3 batch feature pipeline — `build_features()` turns one ticker's full `daily_prices` history into a labeled (UP/DOWN/FLAT, 5-day-ahead) DataFrame. Pure pandas, offline-only, not imported by any request path |
+| `backend/scripts/build_ml_dataset.py` | Phase 3 dataset builder — pulls all 10 tickers from the live DB, runs `features.py` per ticker, does a per-ticker chronological 70/15/15 split, writes `backend/ml_data/{train,val,test}.parquet` (gitignored) |
 
 ## Environment / secrets (never commit these — they live in `.env`, gitignored)
 

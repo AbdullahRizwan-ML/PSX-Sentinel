@@ -324,4 +324,53 @@ path now share one code path rather than diverging.
 
 ---
 
+## 2026-06-27 — Phase 3 Session 1 built: ML feature pipeline + labeled dataset
+
+Built via Claude Code (Opus 4.7 session): `backend/app/ml/__init__.py` (new),
+`backend/app/ml/features.py` (new), `backend/scripts/build_ml_dataset.py`
+(new). Modified: `.gitignore` (added `backend/ml_data/`),
+`backend/requirements.txt` (added `pyarrow==18.1.0`, needed for parquet
+output). None of the four agent files or `orchestrator.py` were touched —
+confirmed, this was purely additive new-files work as scoped.
+
+**Target redefinition:** Phase 3 no longer predicts earnings surprise (no
+reported-EPS/consensus data exists anywhere in the DB, no working source for
+it). Target is now 5-trading-day-ahead price direction (UP/DOWN/FLAT, ±1%
+flat band), computed entirely from existing `daily_prices` data — no new
+external source. Full reasoning already captured in the Phase 3 Session 1
+prompt; not repeated here.
+
+**Verified row counts (live DB, not log claims):** 12,025 raw `daily_prices`
+rows read (up from the 9,904 at the June 8 verification — DB has grown since
+via the nightly/manual collector runs), 2,560 rows dropped for insufficient
+lookback (252-day window for `position_52w`) or missing forward window (last
+5 rows per ticker), 9,465 final labeled rows: train 6,621 / val 1,418 / test
+1,426.
+
+**Class distribution (UP/DOWN/FLAT):**
+- Train (n=6,621): UP 40.9%, DOWN 36.6%, FLAT 22.5%
+- Val (n=1,418): UP 43.1%, DOWN 32.9%, FLAT 24.0%
+- Test (n=1,426): UP 40.3%, DOWN 39.1%, FLAT 20.6%
+
+±1% threshold judged acceptable — no class drops below 20% in any split, well
+clear of the "under 10%" red line from the spec.
+
+**Split logic:** per-ticker chronological, integer row-cutoff at 70%/85% of
+each ticker's date-sorted rows (train/val/test), not a random or global-date
+split — adjacent rows share most of their feature window, so a random split
+would leak future data into training. Verified per-ticker, directly on the
+output parquet files: `train_max_date < val_min_date < val_max_date <
+test_min_date` holds for all 10 tickers, confirming no temporal leakage.
+
+**Two new open issues filed** (see `docs/KNOWN_ISSUES.md`): ENGRO has
+noticeably shorter price history than the other 9 tickers (887 vs ~1,238 raw
+rows), and one row in the dataset build produced a ~-88% forward-5-day
+return, almost certainly an unadjusted stock split rather than a real move.
+Neither blocks this session's deliverable; both are flagged for follow-up.
+
+**Explicit confirmation: no model training code was written this session.**
+`backend/app/ml/features.py` and `build_ml_dataset.py` contain feature
+engineering and dataset-splitting only — no `xgboost`, `lightgbm`, or
+`sklearn` imports, no `.fit()` calls anywhere in either file.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

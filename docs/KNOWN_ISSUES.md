@@ -108,6 +108,45 @@ consistently-nonzero term) and/or PUCARS scraping produces real filing data
 it's the expected output of the current formula with two of its four terms
 structurally pinned to zero.
 
+### ENGRO has shorter price history than other tickers
+
+ENGRO has 887 raw `daily_prices` rows vs. ~1,238 for the other 9 tickers
+(confirmed via the Phase 3 Session 1 dataset build, 2026-06-27).
+
+**Root cause:** the mid-execution Antigravity session quota-out during the
+Phase 2A fix run (see Build Log, 2026-06-07/08 entry) — the recovery run
+never went back and backfilled ENGRO's missing date range.
+
+**Current impact:** handled gracefully by Phase 3's per-ticker chronological
+split (ENGRO just gets proportionally fewer train/val/test rows), so it is
+not currently breaking anything. But it means ENGRO is trained/tested on a
+narrower history than every other ticker, which could make any
+ENGRO-specific model evaluation less reliable than for other tickers.
+
+**Suggested fix (not yet done):** re-run the price collector specifically
+for ENGRO against the PSX DPS endpoint to backfill the missing date range,
+then re-verify row count via direct SQL before rebuilding the ML dataset.
+
+### Suspected unadjusted stock-split row in daily_prices
+
+One row produced a ~-88% forward 5-day return in the Phase 3 Session 1
+dataset build (2026-06-27) — almost certainly a stock split that wasn't
+adjusted for in the underlying price series, not a real market move.
+
+**Not yet identified:** which ticker/date this is. Not yet fixed.
+
+**Important:** an unadjusted split would corrupt more than just that one
+forward-return label — it would also distort `return_1m`/`return_3m`/moving
+averages for that ticker in the weeks surrounding the split date, since
+those features look backward across the same discontinuity.
+
+**Suggested fix (Phase 3 Session 2 or a dedicated data-quality pass):**
+identify the exact ticker/date via a query for extreme single-day or 5-day
+returns across `daily_prices`, confirm whether it's a real split via a
+news/filing search, and either apply a split adjustment to the price series
+or explicitly filter/winsorize the affected window — don't just clip the one
+extreme label and leave the upstream features contaminated.
+
 ---
 
 ## Resolved
