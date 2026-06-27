@@ -1041,4 +1041,224 @@ committed code directly rather than relying on chat history:
 
 Commit: `504e787`.
 
+## 2026-06-28 — Phase 4 Session 3 complete (price chart on company detail page)
+
+Added a TradingView-`lightweight-charts`-rendered price chart to
+the company detail page. The original prompt scoped this as full
+OHLC candlesticks; the design was rejected in-session because
+`daily_prices.high`/`low` are *derived* as `max(open, close)` /
+`min(open, close)` (PSX DPS provides no real intraday range — see
+`docs/KNOWN_ISSUES.md`). Candle wicks would therefore be
+structurally invisible on every single candle, which is dishonest
+decoration. **Built instead:** a close-price area line + MA20/MA50
+overlay lines on the main pane, with a volume histogram (tinted by
+close-vs-previous-close direction) in a synced lower pane on the
+same time axis. A small caption below the chart states the
+close-line-vs-candlestick decision plainly. Same honesty principle
+already applied to the ML signal card in Session 2.
+
+**Library:** `lightweight-charts` v5.2.0 (TradingView). Picked over
+Recharts because: purpose-built for financial time series, handles
+the trading-day axis natively (no flat weekend-gap workarounds),
+v5's `addSeries(..., paneIndex)` API gives a real synced
+multi-pane chart out of the box, and the app doesn't need
+general-purpose charting elsewhere.
+
+**Files (this session):**
+
+- `backend/app/api/v1/companies.py` — single-line change: bumped
+  the `/companies/{ticker}/prices` `limit` Query ceiling from 365
+  → 2000, so the chart can pull a full ~2-year history in a single
+  request. This is the only backend change in this session and is
+  scoped strictly to that endpoint's query window per the prompt's
+  hard rule.
+- `frontend/package.json` / `package-lock.json` — `lightweight-charts`
+  v5.2.0 added as a dependency. No other deps changed.
+- `frontend/src/lib/api/companies.ts` — added
+  `getCompanyPriceHistory(ticker)` alongside the existing
+  `getCompanyPrices(ticker, limit=90)`. The new function passes an
+  explicit `start_date` 7 years in the past (the `/prices` endpoint
+  defaults its date window to the last 90 days when none is given,
+  so just raising the row `limit` wasn't enough — needed the date
+  window too).
+- `frontend/src/components/price-chart.tsx` — **new component**.
+  Self-contained: fetches its own series via
+  `getCompanyPriceHistory`, computes MAs client-side, renders the
+  chart and the range selector, owns its own loading/error/empty
+  states. Reads `--primary`/`--accent`/`--neutral`/`--bullish`/
+  `--bearish` straight off `:root` via `getComputedStyle` and
+  wraps them in `hsl(...)` for the lightweight-charts API, so the
+  chart inherits the existing "Karachi Dusk" palette without
+  introducing any new ad-hoc colors. Range selector uses
+  `timeScale().setVisibleRange()` for fixed presets and falls
+  back to `fitContent()` for `ALL` and for any preset wider than
+  the ticker's available history (the explicit ENGRO-short-history
+  graceful path).
+- `frontend/src/app/(app)/companies/[ticker]/page.tsx` — added a
+  single `<PriceChart ticker={data.company.ticker} />` between the
+  `CompanyHeader` and the `report ? ReportBody : EmptyState`
+  branch, so the chart renders regardless of whether an
+  IntelligenceReport exists yet for the ticker (the chart's data
+  is independent of the agent pipeline).
+- `backend/scripts/verify_chart_ma.py` — **new read-only
+  diagnostic**. Prints MA20/MA50 for the last 3 trading days per
+  ticker via the canonical backend path (`_compute_indicators` in
+  `app/ml/features.py`), for hand-comparison with the frontend's
+  client-side `computeMA`. Emits both raw and split-adjusted
+  series so the MA values you see in the rendered chart (raw) can
+  be told apart from the ML pipeline's values (adjusted) for
+  tickers with split events.
+
+**Part 2 (MA data source) decision: client-side, computed in the
+component.** Rejected option (b), pulling MAs from a backend
+endpoint, because:
+
+1. The chart already needs the raw close series to render the
+   close-price line itself, so we'd be making a second API call
+   to fetch values the client trivially recomputes from data it
+   already has.
+2. The frontend's `computeMA` is a straight sliding-window mean —
+   identical algorithm to
+   `backend/app/ml/features.py::_compute_indicators` (simple
+   unweighted rolling mean of close, `window=20`/`50`,
+   `min_periods=window`). Same inputs in, same numbers out. No
+   semantic drift risk.
+3. By extending the fetch window (Part 3 below), the first visible
+   day in every preset range already has 20+ / 50+ prior close
+   values to compute from, so MA20/MA50 are accurate from the
+   first visible point — not "ramping up out of zero." (This was
+   the actual concern Part 2 was guarding against.)
+
+**Part 3 (time-range selector):** five presets — 1M (~22 trading
+days), 3M (~63), 6M (~126), 1Y (~252), All. Default = 6M.
+`setVisibleRange()` for 1M/3M/6M/1Y, `fitContent()` for All.
+Edge case: if `prices.length <= want` for any preset (e.g. a
+hypothetical newly-seeded ticker with < 22 rows), fall back to
+`fitContent()` so the chart never shows an empty window. ENGRO's
+shorter history goes through this fallback gracefully for the
+ALL preset and any range wider than what exists.
+
+**Live verification — Part A (MA value cross-check, both code
+paths):**
+
+1. `python backend/scripts/verify_chart_ma.py PPL MCB ENGRO`
+   pulled raw `daily_prices` from the live Neon DB, ran them
+   through `app/ml/features.py::_compute_indicators`, and printed
+   the last 3 trading days' MA20/MA50 per ticker.
+2. With the backend running (uvicorn :8000), fetched the actual
+   `/api/v1/companies/{ticker}/prices?limit=2000&start_date=...`
+   JSON the frontend will consume for PPL/MCB/ENGRO into local
+   files, then ran the frontend's `computeMA` algorithm
+   (re-implemented in Python — same sliding-window math) against
+   those JSON files.
+3. Compared the last 3 days' MA20/MA50 from both paths,
+   byte-for-byte:
+
+```
+PPL   2026-06-05  close=233.50  ma20=230.2085  ma50=223.4178  (both)
+MCB   2026-06-05  close=414.99  ma20=406.1105  ma50=398.7368  (both)
+ENGRO 2025-01-03  close=481.99  ma20=426.9010  ma50=366.3388  (both)
+```
+
+Both paths agreed exactly for all three tickers. ENGRO's date
+range ended at 2025-01-03 (n=887) vs PPL/MCB's 2026-06-05
+(n=1238), which is the documented short-history difference from
+`docs/KNOWN_ISSUES.md` — handled correctly.
+
+**Live verification — Part B (frontend tsc + Next.js dev
+server):**
+
+- `cd frontend && npx tsc --noEmit` → exit 0, no output. All new
+  types align, including the v5 `lightweight-charts` series
+  generics.
+- `npm run dev` boots clean, `/companies/PPL`, `/companies/MCB`,
+  and `/companies/ENGRO` all return HTTP 200 from the SSR shell.
+  No client-side compile errors in the dev-server log.
+
+**Visual UI render NOT independently verified.** Same gap as
+Phase 4 Session 2: the Claude in Chrome MCP isn't connected on
+this machine (`list_connected_browsers` returned `[]`), so no
+in-browser screenshot was taken of the rendered chart. User
+should open
+`http://localhost:3000/companies/{PPL,MCB,ENGRO}` after
+`npm run dev` + login and visually confirm:
+
+1. The chart renders with the close line + both MA overlays + a
+   volume pane below.
+2. The 1M/3M/6M/1Y/All range buttons each change the visible
+   window (and that 1M actually shows ~one month rather than the
+   full range).
+3. ENGRO's "All" shows whatever shorter history exists, not a
+   broken or empty chart.
+4. The honesty caption about derived high/low is visible below
+   the chart (not buried in a tooltip).
+
+**Judgment calls / deviations from the prompt:**
+
+- *No candlesticks, despite that being the prompt's original
+  intent.* Rationale (also surfaced in the prompt itself, which
+  flagged this as a reconsideration): wicks would be structurally
+  invisible on every single candle because `high`/`low` are
+  derived from open/close, so candlesticks would visually
+  *show less* than a clean close-price line while *implying
+  more* depth. The honesty caption + tinted-volume substitute
+  preserves the "directional" visual cue (which is what
+  candlestick body color usually communicates) without faking
+  intraday range.
+- *Client-side MAs, not a new backend endpoint.* Covered in Part
+  2 decision above.
+- *Backend `/prices` `limit` ceiling raised 365 → 2000.* Only
+  way to satisfy the prompt's "fetch a wider window than what's
+  displayed" requirement without doing multiple round-trips per
+  range change. The change is one line, scoped strictly to the
+  endpoint's query window, and changes no behavior for existing
+  callers (the default `limit=90` is unchanged).
+- *Chart rendered OUTSIDE the `report ? ReportBody : EmptyState`
+  branch.* Price data is independent of whether an
+  `IntelligenceReport` has been generated yet — a newly-seeded
+  ticker should still get a chart, even before any agent has
+  ever run. Placing it directly below `CompanyHeader` (rather
+  than inside `ReportBody`) is the natural consequence of that.
+- *Self-contained data fetching.* The `PriceChart` owns its own
+  `getCompanyPriceHistory` call rather than receiving prices via
+  props from the page. Same separation of concerns the
+  `MlSignalCard`/`AnalyzeButton`/etc. components already follow:
+  each card owns the data it needs from the typed API client.
+
+**Confirmation that the five protected files were NOT touched:**
+`git status --porcelain` after this session lists only
+`backend/app/api/v1/companies.py` (the one-line limit bump),
+`frontend/package.json` + `package-lock.json`,
+`frontend/src/app/(app)/companies/[ticker]/page.tsx` (single
+component import + single JSX line),
+`frontend/src/lib/api/companies.ts` (new
+`getCompanyPriceHistory` function), plus two new files
+(`backend/scripts/verify_chart_ma.py`,
+`frontend/src/components/price-chart.tsx`). Neither
+`trend_analyzer.py`, `news_synthesizer.py`, `filing_skeptic.py`,
+`orchestrator.py`, nor `arbitrator.py` appears in the diff.
+
+**Docs updated this session:** `CLAUDE.md`'s Current build state
+got a Phase 4 Session 3 line, and the Key files map got two new
+entries (`frontend/src/components/price-chart.tsx`,
+`backend/scripts/verify_chart_ma.py`); the
+`frontend/src/app/(app)/companies/[ticker]/page.tsx` row was
+extended to note the new chart wiring. This BUILD_LOG entry was
+added.
+
+**What Session 4 should pick up next:** per Phase 4 Session 1's
+original priority list, the remaining slices are the **watchlist
+UI** (touches the existing `/watchlist` endpoint — closest to
+"production-grade" for a recruiter demo, since saved tickers is a
+real user-flow) or the **news article list** (renders the
+existing `/companies/{ticker}/news` endpoint). The watchlist is
+probably higher signal — it exercises a new endpoint family and
+adds a CRUD flow the dashboard doesn't currently have, whereas
+news is mostly read-only display of one already-paginated list.
+Worth noting: news matching is "noisy" per `KNOWN_ISSUES.md`, so
+a news UI would need to surface the LLM-judged-relevant articles
+distinctly from the keyword-matched set, otherwise the page will
+read as "9 PPL articles" when most are tangentially about
+petroleum, not the company — design beats raw rendering here.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

@@ -238,7 +238,7 @@ async def get_prices(
     end_date: date | None = Query(
         default=None, description="End date (YYYY-MM-DD)"
     ),
-    limit: int = Query(default=90, ge=1, le=365, description="Max records"),
+    limit: int = Query(default=90, ge=1, le=2000, description="Max records"),
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[PricePoint]:

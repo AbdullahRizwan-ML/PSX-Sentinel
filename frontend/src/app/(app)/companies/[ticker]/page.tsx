@@ -35,6 +35,7 @@ import { SignalBadge } from "@/components/signal-badge";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorState } from "@/components/error-state";
 import { AnalyzeButton } from "@/components/analyze-button";
+import { PriceChart } from "@/components/price-chart";
 import { Card, CardContent } from "@/components/ui/card";
 import {
   cn,
@@ -119,6 +120,8 @@ export default function CompanyDetailPage() {
       {!loading && !error && data && (
         <>
           <CompanyHeader company={data.company} report={data.report} />
+
+          <PriceChart ticker={data.company.ticker} />
 
           {reportError && (
             <ErrorState

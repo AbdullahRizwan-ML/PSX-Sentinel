@@ -40,6 +40,34 @@ export function getCompanyPrices(
   );
 }
 
+/*
+ * Pull the full available price history for one ticker (up to the
+ * backend's configured ceiling). Used by PriceChart so MA20/MA50 can
+ * be computed client-side over the entire series — that way the
+ * overlay lines are accurate from the very first visible day of the
+ * smallest range, instead of ramping up out of zero. The backend
+ * ceiling is 2000 rows, comfortably above any ticker's ~2-year history
+ * (~500 trading days) with headroom for ENGRO and for adding more
+ * tickers later.
+ *
+ * Note: the /prices endpoint defaults its date window to the last 90
+ * days when no start_date is given — so we explicitly pass a
+ * start_date deep enough in the past (~7 years) to cover any seeded
+ * ticker's full history. The actual row count is then capped by the
+ * limit parameter, not the date window.
+ */
+export function getCompanyPriceHistory(
+  ticker: string
+): Promise<PricePoint[]> {
+  const startDate = new Date();
+  startDate.setFullYear(startDate.getFullYear() - 7);
+  const startStr = startDate.toISOString().slice(0, 10);
+  return apiRequest<PricePoint[]>(
+    `/api/v1/companies/${encodeURIComponent(ticker)}/prices` +
+      `?limit=2000&start_date=${startStr}`
+  );
+}
+
 export function getLatestReport(ticker: string): Promise<IntelligenceReportResponse> {
   return apiRequest<IntelligenceReportResponse>(
     `/api/v1/companies/${encodeURIComponent(ticker)}/report`
