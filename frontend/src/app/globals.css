@@ -1,0 +1,152 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * PSX Sentinel — design tokens
+ *
+ * Palette name: "Karachi Dusk".
+ *  - Primary: deep teal — institutional but warm, avoids the SaaS-blue default.
+ *  - Accent: terracotta — a warm, regional-feeling secondary used sparingly
+ *    (badges, hover accents, the analyze CTA), never for body text or large fills.
+ *  - Bullish: a deep sage, not the harsh trading-screen green.
+ *  - Bearish: a muted brick, not pure red.
+ *
+ * Numbers always use the Inter "tabular-nums" feature so columns of figures
+ * line up without jitter. The display serif (Fraunces) is reserved for
+ * headings and the conviction score itself — never for body copy.
+ */
+
+@layer base {
+  :root {
+    /* Surfaces — warm cream, not pure white */
+    --background: 35 36% 97%;
+    --foreground: 195 30% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 195 30% 12%;
+
+    --surface: 35 30% 94%;
+    --surface-foreground: 195 30% 14%;
+
+    --muted: 35 20% 90%;
+    --muted-foreground: 195 12% 38%;
+
+    /* Brand */
+    --primary: 192 65% 22%;          /* deep teal */
+    --primary-foreground: 35 36% 97%;
+
+    --accent: 14 65% 56%;            /* terracotta */
+    --accent-foreground: 0 0% 100%;
+
+    /* Semantic — directional signals */
+    --bullish: 158 28% 38%;          /* deep sage */
+    --bullish-foreground: 0 0% 100%;
+    --bullish-muted: 158 30% 90%;
+
+    --bearish: 6 50% 48%;            /* muted brick */
+    --bearish-foreground: 0 0% 100%;
+    --bearish-muted: 6 50% 92%;
+
+    --neutral: 38 35% 55%;           /* warm amber-ish for "balanced" */
+    --neutral-foreground: 195 30% 12%;
+
+    --destructive: 0 70% 45%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Form + borders */
+    --border: 195 14% 86%;
+    --input: 195 14% 86%;
+    --ring: 192 65% 32%;
+
+    --shadow: 195 40% 18%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 198 30% 8%;
+    --foreground: 35 30% 94%;
+
+    --card: 198 28% 12%;
+    --card-foreground: 35 30% 94%;
+
+    --surface: 198 26% 14%;
+    --surface-foreground: 35 30% 94%;
+
+    --muted: 198 20% 18%;
+    --muted-foreground: 35 15% 70%;
+
+    --primary: 188 60% 58%;          /* lifted teal in dark mode for AA contrast */
+    --primary-foreground: 198 30% 8%;
+
+    --accent: 14 68% 62%;
+    --accent-foreground: 198 30% 8%;
+
+    --bullish: 158 38% 55%;
+    --bullish-foreground: 198 30% 8%;
+    --bullish-muted: 158 26% 22%;
+
+    --bearish: 6 60% 60%;
+    --bearish-foreground: 198 30% 8%;
+    --bearish-muted: 6 36% 24%;
+
+    --neutral: 38 50% 65%;
+    --neutral-foreground: 198 30% 8%;
+
+    --destructive: 0 65% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 198 22% 22%;
+    --input: 198 22% 22%;
+    --ring: 188 60% 58%;
+
+    --shadow: 0 0% 0%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-feature-settings: "ss01", "cv11";
+  }
+
+  /* Numerics: tabular-nums everywhere by default for clean alignment */
+  .nums,
+  [data-nums] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Subtle background pattern — a single dotted texture on the page surface.
+     It's almost invisible, but it gives the page a sense of paper/weight
+     instead of feeling flat-white like every other SaaS template. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: radial-gradient(
+      hsl(var(--foreground) / 0.025) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+    z-index: 0;
+  }
+  body > * {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+@layer components {
+  .focus-ring {
+    @apply outline-none ring-offset-2 ring-offset-background focus-visible:ring-2 focus-visible:ring-ring;
+  }
+}
