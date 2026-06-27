@@ -968,4 +968,77 @@ nicely under the conviction header. Worth flagging that the
 Recharts vs lightweight-charts library decision hasn't been made
 yet; Session 1's notes don't pin it down.
 
+## 2026-06-28 — Phase 4 Session 1 doc backfill (code shipped 2026-06-27 as `504e787`, docs missed at the time)
+
+**This entry is being added after the fact.** The Phase 4 Session 1
+frontend scaffold was built and committed in `504e787` on
+2026-06-27 without a corresponding `CLAUDE.md`/`BUILD_LOG.md`
+update — the commit was scoped purely to `frontend/`. This entry
+and the matching `CLAUDE.md` "Current build state" line are being
+added now, one session later (after Phase 4 Session 2's `9c4224b`
+had already landed), so the record is honest about *when the
+documentation happened* versus *when the code shipped*. No
+frontend or backend code was touched to produce this entry.
+
+**What `504e787` actually shipped**, confirmed by reading the
+committed code directly rather than relying on chat history:
+
+- **Stack:** Next.js 15 (App Router) + TypeScript + Tailwind +
+  hand-built shadcn/ui-style primitives (`frontend/src/components/ui/`
+  — button, input, label, card; not generated via the shadcn CLI).
+  New top-level `frontend/` directory in the same monorepo as
+  `backend/`.
+- **Design system** (`frontend/src/app/globals.css`): palette
+  named "Karachi Dusk" — deep teal primary, terracotta accent used
+  sparingly, deep-sage bullish / muted-brick bearish (deliberately
+  not trading-screen green/red), warm cream surfaces instead of
+  pure white. Type pairing is Fraunces (display/serif — headings
+  and the conviction score) + Inter (body, with tabular-nums for
+  any column of figures). `frontend/src/components/conviction-dial.tsx`
+  is the one concrete "point of view" decision: a custom SVG
+  semicircular gauge that maps the 0-100 conviction score to a
+  needle angle (-90°..+90°) over a bearish→neutral→bullish gradient
+  arc, animated on mount. Rationale: a plain number is forgettable;
+  a needle position reads instantly, and it stays honest about the
+  current state of the system — most live conviction scores cluster
+  near 58.5 (see `KNOWN_ISSUES.md`), so most needles currently sit
+  "just past center," which is the true state, not a dressed-up one.
+- **API layer:** single typed chokepoint
+  (`frontend/src/lib/api/client.ts`'s `apiRequest<T>()`), mirroring
+  the backend's `LLMGateway` single-chokepoint philosophy. Handles
+  JWT access+refresh with auto-refresh-on-401-retry-once.
+  `frontend/src/lib/auth/context.tsx` provides `AuthProvider`/`useAuth()`.
+- **Pages:** login + register (real backend calls, real error-state
+  mapping for 401/409/422/network failures, not just the happy
+  path), dashboard (10-ticker universe, per-company conviction at a
+  glance via `CompanyCard`+`ConvictionDial`, designed loading
+  skeletons and a real empty/CTA state), company detail (full
+  `IntelligenceReport`: conviction score, bull/bear narrative, risk
+  factors, `MlSignalCard` surfacing the ML signal). At the time this
+  page only had `ml_beat_probability` to work with — `score_breakdown`
+  wasn't exposed by the API yet — so `MlSignalCard` showed only the
+  UP-class probability with an explicit "Low confidence" caveat and
+  a 55%-gate marker line, rather than fabricating the missing
+  per-class detail. **This gap was resolved one session later in
+  Phase 4 Session 2 (`9c4224b`)**, which added `score_breakdown` to
+  `IntelligenceReportResponse` and split the card into
+  `MlSignalCardRich`/`MlSignalCardLegacy`.
+- **Live verification actually performed during the original
+  session:** end-to-end curl-based API integration against the real
+  Neon Cloud/Upstash-backed backend (register → login → `/me` →
+  companies list → company detail → report), with returned values
+  matching already-documented figures exactly (PPL
+  `conviction_score=58.5`, `ml_beat_probability≈0.4001`); `npx tsc
+  --noEmit` clean; all 4 routes (`/login`, `/register`, `/dashboard`,
+  `/companies/PPL`) compiled and served HTTP 200 by the Next dev
+  server. **Honest gap flagged at the time:** no interactive
+  in-browser visual walkthrough was performed inside the session
+  itself — only curl calls and pre-hydration SSR-shell checks, since
+  client-rendered pages show only a loading shell to a non-JS HTTP
+  client. A manual browser walkthrough was carried out afterward,
+  outside the session that built the code, before the commit was
+  made.
+
+Commit: `504e787`.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->
