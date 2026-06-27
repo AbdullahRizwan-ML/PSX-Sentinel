@@ -7,8 +7,55 @@ user alerts, and watchlist management endpoints.
 
 import uuid
 from datetime import date, datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class MlDetail(BaseModel):
+    """
+    Per-run detail of the ML price-direction signal, mirroring the
+    ``ml_detail`` sub-dict that ``Arbitrator._build_score_breakdown``
+    persists into ``IntelligenceReport.agent_outputs``.
+
+    All fields are nullable because the Arbitrator emits the block
+    even when the model was unavailable or when the gate failed —
+    consumers can distinguish "real bullish signal" from "model
+    unavailable" from "below confidence threshold" by reading
+    ``gate_passed`` and ``skip_reason`` together.
+    """
+
+    # ``model_caveat`` collides with Pydantic v2's protected ``model_``
+    # namespace — silence the warning since this is a deliberate name
+    # mirrored from the persisted JSON, not an internal field.
+    model_config = ConfigDict(protected_namespaces=())
+
+    gate_passed: bool
+    skip_reason: str | None = None
+    predicted_class: str | None = None
+    max_prob: float | None = None
+    probabilities: dict[str, float] | None = None
+    confidence_threshold: float | None = None
+    as_of_date: str | None = None
+    magnitude_points: float | None = None
+    model_caveat: str | None = None
+
+
+class ScoreBreakdown(BaseModel):
+    """
+    Per-term contributions that sum (plus the base of 50) to the
+    final ``conviction_score`` on an IntelligenceReport.
+
+    Mirrors the ``score_breakdown`` dict emitted by
+    ``Arbitrator._build_score_breakdown`` and persisted under
+    ``IntelligenceReport.agent_outputs['arbitrator']['output']``.
+    """
+
+    technical_contribution: float
+    news_contribution: float
+    filing_contribution: float
+    ml_contribution: float
+    ml_detail: MlDetail | None = None
 
 
 class IntelligenceReportResponse(BaseModel):
@@ -28,6 +75,69 @@ class IntelligenceReportResponse(BaseModel):
     technical_signal: str
     total_tokens_used: int
     generation_time_seconds: float
+    # Additive over the legacy schema. Pulled out of the persisted
+    # ``agent_outputs`` blob by the validator below so the frontend
+    # doesn't have to dig into a raw JSON dict. ``None`` for any
+    # report row written before this field existed (and during the
+    # in-progress placeholder window before the Arbitrator finishes).
+    score_breakdown: ScoreBreakdown | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_score_breakdown(cls, data: Any) -> Any:
+        """
+        Pull ``score_breakdown`` out of the persisted
+        ``agent_outputs['arbitrator']['output']`` JSON so it appears
+        as a typed top-level field on the response.
+
+        Handles three input shapes:
+        - ORM instance (``IntelligenceReport``): hoist via attribute
+          access, return a dict of all needed fields.
+        - dict with ``agent_outputs`` already present: same hoist, in
+          place.
+        - dict already shaped like the response (e.g. cached JSON
+          deserialised by ``model_validate_json``): pass through
+          unchanged.
+        """
+        # Cached-JSON path: dict already shaped like the response and
+        # may not carry ``agent_outputs`` at all. Nothing to do.
+        if isinstance(data, dict) and "agent_outputs" not in data:
+            return data
+
+        agent_outputs: Any
+        if isinstance(data, dict):
+            agent_outputs = data.get("agent_outputs")
+        else:
+            agent_outputs = getattr(data, "agent_outputs", None)
+
+        if not isinstance(agent_outputs, dict):
+            return data
+
+        arb = agent_outputs.get("arbitrator")
+        if not isinstance(arb, dict):
+            return data
+        arb_output = arb.get("output")
+        if not isinstance(arb_output, dict):
+            return data
+        sb = arb_output.get("score_breakdown")
+        if not isinstance(sb, dict):
+            return data
+
+        # Re-build a plain dict so Pydantic doesn't try to also pull
+        # ``score_breakdown`` off the ORM via attribute access (it
+        # isn't an attribute) and so the cached-JSON code path stays
+        # symmetric.
+        if isinstance(data, dict):
+            result = {k: v for k, v in data.items() if k != "agent_outputs"}
+        else:
+            result = {}
+            for name in cls.model_fields:
+                if name == "score_breakdown":
+                    continue
+                if hasattr(data, name):
+                    result[name] = getattr(data, name)
+        result["score_breakdown"] = sb
+        return result
 
 
 class AnalysisJobResponse(BaseModel):

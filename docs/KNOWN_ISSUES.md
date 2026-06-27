@@ -102,6 +102,16 @@ consistently nonzero, because:
   gate" from "model unavailable" from "insufficient history". Until
   the model is retrained on a stronger feature set or class-balanced
   better, expect this term to keep contributing 0 in production.
+  **Update (Phase 4 Session 2, 2026-06-27):** the invisibility half of
+  this is now fixed — `score_breakdown.ml_detail` (including all 3
+  class probabilities and the gate/skip_reason status) is exposed on
+  `GET /companies/{ticker}/report` and rendered on the company-detail
+  page via `MlSignalCardRich`. So a user can now actually *see* that
+  the model is evaluating each ticker and consistently landing just
+  below the gate, rather than the term just silently reading 0 with
+  no explanation. The underlying model is still weak (same 39%
+  accuracy, same gate, same near-0.4 probability cluster) — only the
+  visibility changed, not the prediction quality.
 
 **Expected to ease once:** PUCARS scraping produces real filing data
 (lets `filing_contribution` actually vary), and/or a future ML

@@ -74,6 +74,44 @@ export type TechnicalSignal =
   | "SELL"
   | "STRONG_SELL";
 
+export type MlPredictedClass = "UP" | "DOWN" | "FLAT";
+
+export type MlSkipReason =
+  | "model_unavailable"
+  | "insufficient_history"
+  | "below_confidence_threshold";
+
+/*
+ * Per-run detail of the ML price-direction signal. Mirrors the
+ * MlDetail Pydantic schema in backend/app/schemas/intelligence.py,
+ * which itself mirrors the ml_detail dict persisted by the
+ * Arbitrator. All fields are nullable because the block is emitted
+ * even when the model was unavailable.
+ */
+export interface MlDetail {
+  gate_passed: boolean;
+  skip_reason: MlSkipReason | string | null;
+  predicted_class: MlPredictedClass | string | null;
+  max_prob: number | null;
+  probabilities: { DOWN?: number; FLAT?: number; UP?: number } | null;
+  confidence_threshold: number | null;
+  as_of_date: string | null;
+  magnitude_points: number | null;
+  model_caveat: string | null;
+}
+
+/*
+ * Per-term contributions that (plus a base of 50) sum to the final
+ * conviction_score. Mirrors backend ScoreBreakdown.
+ */
+export interface ScoreBreakdown {
+  technical_contribution: number;
+  news_contribution: number;
+  filing_contribution: number;
+  ml_contribution: number;
+  ml_detail: MlDetail | null;
+}
+
 export interface IntelligenceReportResponse {
   id: string;
   ticker: string;
@@ -87,6 +125,9 @@ export interface IntelligenceReportResponse {
   technical_signal: TechnicalSignal;
   total_tokens_used: number;
   generation_time_seconds: number;
+  // Optional because older persisted reports (or reports cached
+  // before this field was added to the schema) may not carry it.
+  score_breakdown?: ScoreBreakdown | null;
 }
 
 export interface MarketSummaryResponse {

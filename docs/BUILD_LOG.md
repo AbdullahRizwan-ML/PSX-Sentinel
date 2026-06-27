@@ -747,4 +747,225 @@ backfill needed since the field is purely additive metadata.
   what the prompt strictly required but matches the prompt's "Visible
   low-confidence labeling (do this, it's expected practice)" spirit.
 
+## 2026-06-27 — Phase 4 Session 2 built: ScoreBreakdown exposed on the API + MlSignalCard upgraded
+
+Built via Claude Code (Opus 4.7 session). Phase 4 Session 1 noted
+that the persisted `score_breakdown` / `ml_detail` blob in
+`agent_outputs` wasn't reachable from the frontend because
+`IntelligenceReportResponse` only exposed the legacy
+`ml_beat_probability` float. This session closes that gap: the typed
+sub-schema is now part of the API response and the company-detail
+page consumes it.
+
+**Files modified (exact list):**
+
+*Backend:*
+- `backend/app/schemas/intelligence.py` — added `MlDetail` and
+  `ScoreBreakdown` Pydantic models, added
+  `score_breakdown: ScoreBreakdown | None = None` to
+  `IntelligenceReportResponse`, plus a `@model_validator(mode="before")`
+  that hoists the breakdown from
+  `agent_outputs["arbitrator"]["output"]["score_breakdown"]` so
+  every existing call site (`model_validate(report)` /
+  `model_validate_json(cached)`) just works without touching the
+  endpoints. `MlDetail.model_config = ConfigDict(protected_namespaces=())`
+  to silence the Pydantic v2 warning on the `model_caveat` field
+  name.
+
+*Frontend:*
+- `frontend/src/lib/api/types.ts` — added `MlPredictedClass`,
+  `MlSkipReason`, `MlDetail`, `ScoreBreakdown` interfaces and the
+  optional `score_breakdown` field on `IntelligenceReportResponse`.
+- `frontend/src/app/(app)/companies/[ticker]/page.tsx` — rewrote
+  `MlSignalCard` to branch on `score_breakdown?.ml_detail`:
+  rich-detail path renders DOWN / FLAT / UP per-class probability
+  bars with the gate marker, highlights the predicted class, and
+  shows an honest status panel that distinguishes
+  `below_confidence_threshold` from `insufficient_history` from
+  `model_unavailable`. Legacy fallback path (renamed
+  `MlSignalCardLegacy`) preserves the previous UP-only rendering
+  unchanged for cached/older responses that lack the new field.
+  Added a new `ScoreBreakdownStrip` component showing the
+  base 50 + technical + news + filing + ML contributions adding up
+  to the final conviction score — judgment call, see below.
+
+*Verification helper (new, kept for future re-use):*
+- `backend/scripts/verify_score_breakdown.py` — read-only script
+  that pulls the latest report per ticker and shows DB-vs-schema
+  hoisted output side-by-side. No inserts, no LLM calls.
+
+**Files NOT touched (confirmed):** `trend_analyzer.py`,
+`news_synthesizer.py`, `filing_skeptic.py`, `orchestrator.py`, and
+`arbitrator.py`. Confirmed via the unmodified-list in `git status`:
+this session is a serialization/UI change, not a scoring change. The
+Arbitrator's `_calculate_score` math is unchanged; the persisted
+score_breakdown shape is unchanged. Only the response schema and the
+component that renders it moved.
+
+**Exact shape of the new `ScoreBreakdown` schema:**
+
+```
+ScoreBreakdown:
+  technical_contribution: float
+  news_contribution: float
+  filing_contribution: float
+  ml_contribution: float
+  ml_detail: MlDetail | None
+
+MlDetail:
+  gate_passed: bool
+  skip_reason: str | None
+  predicted_class: str | None
+  max_prob: float | None
+  probabilities: dict[str, float] | None
+  confidence_threshold: float | None
+  as_of_date: str | None
+  magnitude_points: float | None
+  model_caveat: str | None
+```
+
+Field names mirror the persisted JSON exactly — verified by reading
+`backend/app/agents/arbitrator.py::_build_score_breakdown` directly
+(not assumed from Phase 3 Session 3's report). The persisted
+`score_breakdown` carries those four contribution fields plus an
+`ml_detail` sub-dict with the nine fields above. Schema and
+persisted shape are 1:1.
+
+**Live verification — Part A (direct DB cross-check via
+`backend/scripts/verify_score_breakdown.py`, no HTTP layer):**
+
+For PPL / MCB / UBL, the latest `IntelligenceReport.agent_outputs`'s
+`arbitrator.output.score_breakdown` was dumped raw and compared
+against `IntelligenceReportResponse.model_validate(report).score_breakdown.model_dump()`.
+All three came back `Cross-check (DB == schema): True`. Example
+(PPL, abbreviated):
+
+```
+technical_contribution = 8.5
+news_contribution = 0.0
+filing_contribution = 0.0
+ml_contribution = 0.0
+ml_detail:
+  gate_passed = False
+  skip_reason = "below_confidence_threshold"
+  predicted_class = "UP"
+  max_prob = 0.40006
+  probabilities = {DOWN: 0.30857, FLAT: 0.29137, UP: 0.40006}
+  confidence_threshold = 0.55
+  as_of_date = "2026-06-05"
+  magnitude_points = 5.0
+  model_caveat = "Technical-only XGBoost; ..."
+```
+
+UBL came back with `gate_passed=True`, `ml_contribution=5.0`,
+`confidence_threshold=0.35` — this is the gate-pass demo row left
+behind by Phase 3 Session 3 (production gate is 0.55, that row was
+written when the threshold was temporarily lowered in-process for
+verification). Exercising the gate-passed code path in the frontend
+without retraining the model was a free side-benefit.
+
+**Live verification — Part B (HTTP API, real backend running):**
+
+Started uvicorn on :8000, registered a fresh test user
+(`phase4verify@example.com`) to grab a JWT, hit
+`GET /api/v1/companies/PPL/report` and `GET /api/v1/companies/UBL/report`.
+
+First PPL request returned `score_breakdown: null` — caught a real
+gotcha: the response was being served from the 24-hour Redis cache
+(`REPORT_CACHE_KEY = "report:{ticker}:{date}"`), populated before
+the schema change. Invalidated the three test cache keys via
+`redis_client.delete_cached` and re-fetched. PPL then returned the
+full block, byte-for-byte the same numbers as the direct DB dump
+above:
+
+```
+"score_breakdown": {
+  "technical_contribution": 8.5,
+  "news_contribution": 0.0,
+  "filing_contribution": 0.0,
+  "ml_contribution": 0.0,
+  "ml_detail": {
+    "gate_passed": false,
+    "skip_reason": "below_confidence_threshold",
+    "predicted_class": "UP",
+    "max_prob": 0.4000595510005951,
+    "probabilities": {"DOWN": 0.30857, "FLAT": 0.29137, "UP": 0.40006},
+    "confidence_threshold": 0.55, ...
+  }
+}
+```
+
+UBL came back with `gate_passed: true`, `ml_contribution: 5.0`,
+`skip_reason: null` — both code paths covered end-to-end.
+
+**Cache invalidation note for future deployments:** because of the
+24-hour TTL, after this change ships to production any ticker viewed
+in the last 24 hours will keep returning the cached `null`
+`score_breakdown` until the TTL expires. Frontend handles this
+gracefully (legacy fallback rendering), but if instant rollout is
+desired, the deploy step should `DEL report:*` from Upstash.
+
+**Live verification — Part C (frontend `tsc` + Next.js dev server):**
+
+- `cd frontend && npx tsc --noEmit` — exited 0 with no output. All
+  new types align.
+- `npm run dev` boots cleanly, `GET /companies/PPL` returns HTTP 200
+  with the expected client-side `Loading…` shell (page is
+  `"use client"` and auth-gated, so SSR renders only the spinner
+  until hydration). No SSR/runtime errors in the bundle.
+
+**Visual UI render NOT independently verified:** the Claude in
+Chrome MCP isn't connected on this machine
+(`list_connected_browsers` returned `[]`), so I did not screenshot
+the rendered page after login. The component changes are verified
+by tsc + manual code review of the branch logic
+(MlSignalCardRich / MlSignalCardLegacy fall-through, ClassProbBar
+math, ScoreBreakdownStrip sum check). User should open
+http://localhost:3000/companies/PPL after `npm run dev` + login to
+confirm the visual treatment matches intent before merging.
+
+**Judgment calls / deviations from the prompt:**
+
+- *Per-term ScoreBreakdownStrip added inline this session, not
+  deferred.* The prompt left it to judgment. Reasoning: it's the
+  most natural place to surface the breakdown (right after the
+  bull/bear cards, above the risk/ML row), it's an additive card
+  that doesn't perturb existing layout, and it directly addresses
+  the open issue documented in `KNOWN_ISSUES.md` where many tickers
+  cluster around conviction 58.5 because three of the four scoring
+  terms are structurally pinned to 0 right now — showing the math
+  makes that visible to the user instead of mysterious. Total cost
+  was ~70 lines of new component code.
+- *Pydantic `model_validator(mode="before")` instead of touching
+  every endpoint.* `IntelligenceReportResponse` is constructed in
+  ~5 places across two routers, and four of those use ORM input
+  while one uses cached-JSON input. Centralising the hoist in the
+  schema means none of the routers had to change, the cached-JSON
+  path stays symmetric, and any future endpoint that returns this
+  schema automatically gets `score_breakdown` for free.
+- *Field name `model_caveat` kept (not renamed).* Pydantic v2's
+  `model_` namespace warning is silenced via `protected_namespaces=()`
+  on `MlDetail`. Renaming the field would have meant changing the
+  persisted JSON shape, which would have rippled into the
+  Arbitrator's `_build_score_breakdown` — explicitly out of scope
+  for this session per the hard rules.
+- *Legacy `MlSignalCard` rendering preserved as a fallback rather
+  than deleted.* Older `IntelligenceReport` rows persisted before
+  Phase 3 Session 3 (e.g. MCB's Phase 2B Session 2 row) carry no
+  `ml_detail` block — that's an existing data-shape diversity, not
+  something this session created. The fallback keeps those rows
+  rendering correctly instead of crashing or showing empty bars.
+
+**What Session 3 (next) likely needs:** per Phase 4 Session 1's
+remaining priority list, the next coherent slice is either the
+watchlist UI (touching the existing `/watchlist` API), the
+price-chart panel on the company detail page (uses
+`/companies/{ticker}/prices` which already returns OHLCV), or the
+news article list (uses `/companies/{ticker}/news`). The price
+chart is probably the highest visual-impact-to-effort ratio — the
+data's already there, and a chart anchors the page's left column
+nicely under the conviction header. Worth flagging that the
+Recharts vs lightweight-charts library decision hasn't been made
+yet; Session 1's notes don't pin it down.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->
