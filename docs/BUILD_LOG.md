@@ -1555,3 +1555,354 @@ distinction against, rather than the frontend having to invent
 the distinction visually from a raw matched-articles list.
 
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->
+
+## 2026-06-28 — Phase 4 Session 5: news article list on the company detail page
+
+**Goal.** Render NewsSynthesizer's relevance judgment as a real
+piece of content on the company detail page, distinguishing the
+two meaningfully different "no articles to show" states the prompt
+called out, without showing the noisy raw keyword-matched set. Per
+the prompt's "show only LLM-judged-relevant articles" lock,
+respect that intent even when it forces a more conservative
+render than just dumping the matched list.
+
+**Step 0 — inspect the real persisted shape.** Wrote
+`backend/scripts/inspect_news_state.py` (read-only) and ran it
+against the live Neon DB. Findings:
+
+| Ticker | `news_articles` rows | latest `news_synthesizer.output` |
+|---|---|---|
+| ENGRO | 0 | no report yet |
+| HBL | 0 | no report yet |
+| LUCK | 0 | no report yet |
+| MARI | 0 | no report yet |
+| MCB | 0 | sentiment=NEUTRAL, article_count=0, relevant=0 |
+| MEBL | 0 | no report yet |
+| OGDC | 1 | no report yet |
+| **PPL** | **9** | sentiment=NEUTRAL, article_count=9, **relevant=0** |
+| PSO | 9 | no report yet |
+| UBL | 0 | sentiment=NEUTRAL, article_count=0, relevant=0 |
+
+This established two critical facts that shaped everything else:
+
+  1. The current data covers both zero-states the prompt cares
+     about — but only those two. PPL is the only ticker in the
+     entire universe with matched articles, and the
+     NewsSynthesizer judged 0 of 9 as relevant (textbook
+     "noisy keyword match" — headlines like "Oil prices climb
+     more than $3 after Israeli strikes on Lebanon" got
+     attached to PPL just because "petroleum"). MCB and UBL are
+     the "no articles matched at all" case (the LLM call was
+     skipped per the project's "no real data → no LLM call"
+     rule, so `article_count=0` and `relevant_articles=0`).
+  2. **No live ticker currently exercises the "partial
+     relevance" or "all relevant" render paths.** Those
+     branches will need to be hand-tested against synthetic data
+     when they show up — flagged explicitly below.
+
+**Step 1 — Part 1 decision (backend change needed? yes, minimal).**
+The two zero-states are not currently distinguishable from
+`GET /companies/{ticker}/news` alone (the endpoint returns the
+raw matched articles, no judgment metadata), and `GET
+/companies/{ticker}/report` didn't carry NewsSynthesizer's output
+either — it only carried `score_breakdown` (Phase 4 Session 2).
+So the frontend literally cannot tell "PPL had 9 articles, all
+judged irrelevant" from "MCB had 0 matched articles" using
+only what the API currently serves.
+
+The minimal additive fix per the prompt's Part 1 instruction:
+hoist `news_synthesizer.output` onto `IntelligenceReportResponse`,
+exactly mirroring how `score_breakdown` is already hoisted by
+the existing `@model_validator(mode="before")`. New schema:
+`NewsSynthesis` (sentiment, uniformity, article_count,
+relevant_articles, narrative_summary), set as
+`IntelligenceReportResponse.news_synthesis: NewsSynthesis | None`.
+
+The validator was refactored from "hoist score_breakdown" to
+"hoist score_breakdown AND news_synthesis in a single pre-build
+pass" — same logic, just two source fields. Score_breakdown
+behavior is unchanged and regression-tested per the verification
+section below (it'd be embarrassing to ship a Session 5 schema
+change that broke a Session 2 schema field). NewsSynthesizer's
+LLM prompt, output structure, and analysis logic are **not
+touched** — only what's serialized out of the persisted row.
+This is exactly the "additive metadata only" branch the prompt
+anticipated.
+
+**Step 2 — Part 2 frontend: NewsList component.** Built
+`frontend/src/components/news-list.tsx`. State machine has seven
+modes:
+
+  - `loading` → skeleton (3 row placeholders, soft-pulse)
+  - `error` → bearish-tinted ErrorState with retry button
+  - `no-report-yet` → "no relevance judgment yet" CTA
+    (`news_synthesis === null` means we have no LLM judgment to
+    filter on; rendering the raw matched articles would be the
+    noisy keyword-matched set the lock forbids)
+  - `no-articles-matched` → zero-state 1: "No news articles found
+    for [TICKER]" (`article_count === 0`)
+  - `matched-but-none-relevant` → zero-state 2: "N articles
+    mentioned [TICKER] but NewsSynthesizer judged none genuinely
+    relevant" (`article_count > 0 && relevant_articles === 0`)
+  - `partial-relevance` → zero-state 3: "M of N articles judged
+    relevant; per-article details aren't surfaced — see analyst
+    narrative" (`0 < relevant_articles < article_count`)
+  - `full-relevance` → render the matched list with a
+    bullish-tinted "All N articles judged relevant" header
+    (`relevant_articles === article_count > 0`)
+
+The partial-relevance branch is the one design call worth
+flagging. The prompt's locked-in design ("show only the
+LLM-judged-relevant articles") cannot be literally implemented
+in the partial case, because NewsSynthesizer only persists an
+aggregate `relevant_articles` count — not per-article relevance
+flags — and the prompt's hard rules forbid changing
+NewsSynthesizer's LLM prompt to start emitting per-article
+judgments. So the choice was between:
+
+  - (a) Show all M matched articles when there's any positive
+    relevance count, even though we'd be including articles the
+    LLM judged irrelevant. Violates the lock as written.
+  - (b) Show 0 articles in the partial case with an explanation
+    that per-article details aren't surfaced. Strictly honors
+    the lock; the cost is the partial case shows no list at all.
+  - (c) Pick a heuristic (top-N most recent) as a proxy for
+    "the relevant ones". Dishonest — we'd be implying those
+    specific articles were judged relevant when the system
+    actually said nothing about which subset is which.
+
+Went with **(b)** because it's the only interpretation that
+doesn't either contradict the lock (a) or fabricate per-article
+judgments NewsSynthesizer didn't make (c). For the real PPL data
+this is a moot point — PPL is at 0 relevant of 9 matched, which
+is zero-state 2 (matched-but-none-relevant), and shows no list
+in either reading. For a hypothetical future "5 of 9" ticker,
+this UX will visibly hold back the list. The right long-term fix
+is a separate session where NewsSynthesizer's LLM prompt is
+augmented to emit per-article relevance — which is explicitly
+out of scope this session and explicitly forbidden by the hard
+rules. **Flagged here so a future reader knows this is the
+trade-off the partial-relevance render path embodies, not an
+oversight.**
+
+The `full-relevance` mode reaches the matched-list rendering
+without that ambiguity (when N=M, the LLM judged all of them
+relevant, so showing all of them honors the lock without
+inference). Article rows render headline (linked to source URL
+in a new tab when present), source (pretty-mapped:
+`arynews` → "ARY News"), published date (en-PK locale), and
+the summary line-clamped to 2 lines.
+
+**Visual treatment.** Karachi Dusk consistency: terracotta-accent
+warning icon on the matched-but-none-relevant + partial cases
+(the system's "noise warning" tone, same as the analyze
+ScoreBreakdown's accent dots); bullish-muted band on the
+all-relevant header (signals the LLM's positive judgment); soft
+dashed bordered cards for all zero-states (same visual idiom as
+the existing dashboard EmptyState pattern); muted source/date
+chip + readable headline + line-clamped summary on each list
+row. No new color tokens introduced.
+
+**Step 3 — Part 3 integration.** Placed `<NewsList />` after the
+report body (or after the "no report yet" CTA) on the company
+detail page, NOT inside the `ReportBody` branch. Reasoning: the
+news component reads its own data and handles the
+no-report-yet case internally, so coupling it to the
+report-or-CTA conditional would just push the same logic up a
+level. Visually it lands as the last major section of the page,
+below the bull/bear cases + score breakdown + risk + ML cards
++ ReportMetaStrip — which reads naturally as "supporting
+evidence" rather than headline content, exactly as the prompt
+suggested.
+
+**Live verification — Part A (schema regression + zero-state DB
+classification).** `python backend/scripts/verify_news_synthesis.py`
+against the real DB. For each of the 6 tickers I checked, the
+script does three things: validates the ORM row through the new
+`IntelligenceReportResponse`; cross-checks that the hoisted
+`news_synthesis` is byte-identical to the raw
+`agent_outputs["news_synthesizer"]["output"]`; AND cross-checks
+that the hoisted `score_breakdown` still matches the raw DB
+values term-for-term (regression guard for the validator
+refactor). 3/3 tickers with reports passed both checks; the 3
+without reports were correctly skipped. Zero-state
+classifications matched what the inspect-news-state diagnostic
+saw at the start of the session: PPL=MATCHED_BUT_NONE_RELEVANT,
+MCB+UBL=NO_ARTICLES_MATCHED.
+
+**Live verification — Part B (real HTTP API path).** `python
+backend/scripts/verify_news_api.py` boots a real registered user
+and walks the same HTTP sequence the frontend NewsList takes:
+
+  - Busts today's Redis report-cache for PPL/MCB/UBL up front so
+    the new `news_synthesis` field is guaranteed visible even if
+    a pre-Session-5 cached response was still alive (the
+    Phase 4 Session 2 stale-cache gotcha — see
+    `docs/KNOWN_ISSUES.md`'s "Known environment quirks" / the
+    REPORT_CACHE_KEY note in CLAUDE.md). Today's caches were
+    empty so nothing was deleted, but the bust runs
+    unconditionally so this script is safe to re-run any day.
+  - Registers a fresh `news_api_test_{timestamp}@example.com`
+    user (note: `.test` TLD is rejected by python-email-validator
+    per RFC 6761; `.example.com` per RFC 2606 passes —
+    documenting this here because the first run of the script
+    failed with HTTP 422 on register before that was fixed).
+  - For each test ticker: `GET /report` → asserts
+    `news_synthesis` AND `score_breakdown` are both present in
+    the response body; `GET /news?limit=50` → asserts
+    `news_synthesis.article_count === /news.total` (sanity-check
+    that the agent and the raw articles endpoint agree on what
+    counts as "matched").
+  - 3/3 tickers PASS. Render-mode classification logged for the
+    human reader so the UI's branches can be hand-verified
+    against actual API output. (One scripting note: this script
+    initially emitted Unicode `→` and `⇒` characters that the
+    Windows cp1252 terminal couldn't render — replaced with ASCII
+    `->`/`=>`. Per CLAUDE.md's known quirks, this is the
+    recurring Windows-terminal-encoding issue.)
+
+**Live verification — Part C (frontend tsc + dev-server).**
+`cd frontend && npx tsc --noEmit` → exit 0, no output. All new
+types (`NewsArticleResponse`, `NewsSynthesis`,
+`IntelligenceReportResponse.news_synthesis`) align across the
+typed client, the report response shape, and the NewsList
+component's branches. `npm run dev` boots Next 15.5.19; `curl
+-s -o /dev/null -w "%{http_code}"` against `/login`,
+`/dashboard`, `/companies/PPL` (the matched-but-none-relevant
+case), `/companies/MCB` (no-articles-matched), and
+`/companies/UBL` (no-articles-matched) all return 200. The dev
+server's compile log is clean — no client-side errors, no
+TypeScript warnings, no missing dependencies.
+
+**Port cleanup.** Per the recurring "don't leave dev servers
+running" issue from recent sessions, both `python -m uvicorn`
+and `npm run dev` were terminated via PID-kill at the end of
+verification, then `netstat -ano | grep -E ":(3000|8000)\s.*LISTENING"`
+was re-run and returned "Ports 3000/8000 clear" (literal, not
+inferred). No background processes were left bound to the
+session's dev ports.
+
+**Visual UI render NOT independently verified.** Same gap as
+Phase 4 Sessions 2 / 3 / 4 — the Claude in Chrome MCP isn't
+connected on this machine (`list_connected_browsers` returns
+`[]`). User should open `http://localhost:3000/companies/PPL`
+after `npm run dev` + login and visually confirm:
+
+  1. The NewsList card renders after the report body
+     (post-bull/bear, post-score-breakdown, post-ML).
+  2. PPL shows the zero-state-2 message: header reads "9
+     matched articles — 0 judged relevant by NewsSynthesizer",
+     body shows the dashed-border zero-state card with the
+     accent warning icon and the explanation paragraph.
+  3. MCB and UBL show zero-state-1: header reads "No articles
+     mentioning [TICKER]…", body shows the dashed-border zero
+     state with a ScanSearch icon.
+  4. A ticker with no report yet (HBL, LUCK, ENGRO, MARI,
+     MEBL, OGDC, PSO) shows the "no relevance judgment yet"
+     CTA pointing at the existing AnalyzeButton above.
+  5. After running an analysis (the Generate report button)
+     against one of those tickers, the NewsList card switches
+     to whichever zero-state the new report produces — most
+     likely zero-state 1 (no matched articles) for HBL/LUCK/
+     ENGRO/MARI/MEBL since the DB shows 0 news_articles for
+     them currently.
+
+**Untestable render paths (flagged honestly).** The
+`partial-relevance` and `full-relevance` branches of the state
+machine are wired but **cannot be exercised against current
+live data** — no ticker has `0 < relevant_articles <=
+article_count`. The code paths are unit-clean (typed
+end-to-end, branch logic is straightforward `if/else if` over
+the two counts, no async or external state) but they have not
+seen real DB data flow through them. Two ways to test them
+when the time comes: (a) hand-edit a persisted report's
+`agent_outputs["news_synthesizer"]["output"]["relevant_articles"]`
+in PostgreSQL temporarily, bust the Redis cache, hit the API;
+(b) wait until news matching produces a real positive judgment.
+This is a known limitation flagged here so a future reader
+doesn't mistake "untested code path" for "verified code path."
+
+**Judgment calls / deviations from the prompt.**
+
+  - *Backend change adds a top-level schema field, not a new
+    endpoint.* The prompt suggested "e.g. a `total_matched_count`
+    alongside the existing relevant-article list" as one
+    possible additive shape — that wording implied the
+    relevance data might live on `/news`. I put it on `/report`
+    instead because (a) all the other agent outputs live on
+    `/report`, so it composes naturally with the existing
+    score_breakdown / ml_detail hoist, (b) `/news` is a
+    paginated list and adding a sibling aggregate would
+    inflate every page, (c) the validator pattern is already
+    proven by Session 2. One API call per page load instead of
+    two; consistent with the rest of the schema.
+  - *Strict-lock interpretation of partial-relevance, with an
+    explanation card rather than a list.* Covered in the
+    component-design section above. The only interpretation
+    that doesn't either lie about per-article judgments or
+    violate the lock.
+  - *NewsList placed outside `report ? ReportBody : EmptyState`.*
+    Same reasoning Phase 4 Session 3's PriceChart followed:
+    the component handles its own no-report-yet branch
+    internally, so coupling it to the page's report-or-CTA
+    conditional would push the same logic up a level.
+  - *Self-contained data fetching.* `NewsList` owns its
+    `getCompanyNews` call rather than receiving articles via
+    props from the page. Same pattern as `MlSignalCard` /
+    `AnalyzeButton` / `PriceChart`: each card owns the data
+    it needs from the typed API-client chokepoint.
+  - *Skipped pagination UI even though the endpoint paginates.*
+    Set `limit=50` on the fetch, no page-2 button. ARY News
+    coverage is currently 19 rows across the entire universe
+    and matching density per ticker is single-digit (PPL=9,
+    PSO=9, OGDC=1, everyone else 0) — a paginator would be
+    chrome with nothing behind it. Easy to add later when
+    article volumes grow.
+
+**Confirmation that the five protected files were NOT touched.**
+`git status --porcelain` after this session lists only:
+- `backend/app/schemas/intelligence.py` (additive `NewsSynthesis`
+  schema + dual-hoist validator)
+- `CLAUDE.md` + `docs/BUILD_LOG.md` (this entry)
+- `frontend/src/app/(app)/companies/[ticker]/page.tsx` (one
+  import + one JSX line for `<NewsList ... />`)
+- `frontend/src/lib/api/companies.ts` (new `getCompanyNews`
+  function + corresponding type import)
+- `frontend/src/lib/api/types.ts` (`NewsArticleResponse`,
+  `NewsSynthesis`, `IntelligenceReportResponse.news_synthesis`
+  optional field)
+- New files: `backend/scripts/inspect_news_state.py`,
+  `backend/scripts/verify_news_synthesis.py`,
+  `backend/scripts/verify_news_api.py`,
+  `frontend/src/components/news-list.tsx`
+
+Neither `trend_analyzer.py`, `news_synthesizer.py`,
+`filing_skeptic.py`, `orchestrator.py`, nor `arbitrator.py`
+appears in the diff. Scoring math, relevance-judgment logic,
+and LLM prompts are all unchanged.
+
+**Docs updated this session:** `CLAUDE.md`'s Current build state
+got a Phase 4 Session 5 line (chronologically after Session 4),
+and the Key files map got four new entries
+(`frontend/src/components/news-list.tsx`,
+`backend/scripts/verify_news_synthesis.py`,
+`backend/scripts/verify_news_api.py`,
+`backend/scripts/inspect_news_state.py`); existing entries for
+`frontend/src/app/(app)/companies/[ticker]/page.tsx` and
+`backend/app/schemas/intelligence.py` were extended to note the
+Session 5 wiring + the dual-hoist validator. This BUILD_LOG
+entry was added.
+
+**What Session 6 should pick up next.** Per the user's note in
+the Session 5 prompt, Session 6 is a batched polish pass: dark
+mode toggle, 404 page, unauthenticated landing page, mobile
+nav drawer. All are pure-frontend, none should touch the
+backend or the five protected agent files. Suggested ordering
+for that session: landing page first (unauthenticated entry
+point — affects what a recruiter sees on first click before
+login), then 404 (covers /companies/UNKNOWN and any other
+undefined route), then dark mode (palette already defines all
+the CSS vars — should mostly be a `data-theme="dark"` block in
+globals.css plus the toggle wiring), then mobile nav drawer
+(the NavBar is desktop-only right now, so mobile users get a
+broken header).

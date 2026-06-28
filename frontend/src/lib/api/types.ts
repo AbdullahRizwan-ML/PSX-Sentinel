@@ -112,6 +112,26 @@ export interface ScoreBreakdown {
   ml_detail: MlDetail | null;
 }
 
+/*
+ * Per-run summary of the NewsSynthesizer agent. Mirrors backend
+ * NewsSynthesis (Phase 4 Session 5), which is hoisted out of
+ * IntelligenceReport.agent_outputs['news_synthesizer']['output'].
+ *
+ * Used by NewsList to distinguish the two zero-states:
+ *   - article_count === 0                                  → no articles matched
+ *   - article_count > 0 && relevant_articles === 0         → matched but none judged relevant
+ *   - article_count > 0 && relevant_articles < article_count → partial (LLM said some are relevant
+ *     but doesn't tag which ones — current schema doesn't carry per-article flags)
+ *   - article_count > 0 && relevant_articles === article_count → all matched are relevant
+ */
+export interface NewsSynthesis {
+  sentiment: string;
+  uniformity: string;
+  article_count: number;
+  relevant_articles: number;
+  narrative_summary: string;
+}
+
 export interface IntelligenceReportResponse {
   id: string;
   ticker: string;
@@ -128,6 +148,23 @@ export interface IntelligenceReportResponse {
   // Optional because older persisted reports (or reports cached
   // before this field was added to the schema) may not carry it.
   score_breakdown?: ScoreBreakdown | null;
+  // Optional because older persisted reports may not carry it (or a
+  // cached response from before Phase 4 Session 5 hoisted the field).
+  news_synthesis?: NewsSynthesis | null;
+}
+
+/*
+ * Single news article row. Mirrors backend NewsArticleResponse.
+ */
+export interface NewsArticleResponse {
+  id: string;
+  ticker: string;
+  source: string;
+  headline: string;
+  summary: string | null;
+  url: string;
+  published_at: string;
+  sentiment_score: number | null;
 }
 
 export interface MarketSummaryResponse {

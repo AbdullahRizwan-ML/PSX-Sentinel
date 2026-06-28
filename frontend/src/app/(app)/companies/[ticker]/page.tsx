@@ -36,6 +36,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorState } from "@/components/error-state";
 import { AnalyzeButton } from "@/components/analyze-button";
 import { PriceChart } from "@/components/price-chart";
+import { NewsList } from "@/components/news-list";
 import { WatchlistStar } from "@/components/watchlist-star";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -164,6 +165,21 @@ export default function CompanyDetailPage() {
               className="py-16"
             />
           )}
+
+          {/*
+           * News list rendered after the report body. It's supporting
+           * evidence for the bull/bear narrative the agents produced,
+           * so it reads naturally as the next section down. When
+           * there's no report yet, the component shows its own
+           * "run analysis to see the relevance judgment" CTA — we
+           * can't honestly show a relevant-articles list without an
+           * LLM judgment to filter on, since the raw matched set is
+           * known-noisy per docs/KNOWN_ISSUES.md.
+           */}
+          <NewsList
+            ticker={data.company.ticker}
+            report={data.report}
+          />
         </>
       )}
     </div>

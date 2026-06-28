@@ -4,6 +4,7 @@ import type {
   CompanyResponse,
   IntelligenceReportResponse,
   MarketSummaryResponse,
+  NewsArticleResponse,
   PaginatedResponse,
   PricePoint,
 } from "./types";
@@ -83,4 +84,27 @@ export function triggerAnalysis(ticker: string): Promise<IntelligenceReportRespo
 
 export function getMarketSummary(): Promise<MarketSummaryResponse> {
   return apiRequest<MarketSummaryResponse>("/api/v1/market/summary");
+}
+
+/*
+ * Paginated news articles for a ticker. The backend endpoint returns
+ * the raw keyword-matched set from `news_articles` — no per-article
+ * LLM relevance judgment is attached (NewsSynthesizer only persists
+ * an aggregate `relevant_articles` count, surfaced via
+ * IntelligenceReportResponse.news_synthesis). The NewsList component
+ * uses both this list and that aggregate count to decide what to
+ * render: see the comment block at the top of NewsList for the
+ * full state machine.
+ */
+export function getCompanyNews(
+  ticker: string,
+  params?: { page?: number; limit?: number }
+): Promise<PaginatedResponse<NewsArticleResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.page) qs.set("page", String(params.page));
+  if (params?.limit) qs.set("limit", String(params.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiRequest<PaginatedResponse<NewsArticleResponse>>(
+    `/api/v1/companies/${encodeURIComponent(ticker)}/news${suffix}`
+  );
 }
