@@ -1261,4 +1261,297 @@ distinctly from the keyword-matched set, otherwise the page will
 read as "9 PPL articles" when most are tangentially about
 petroleum, not the company — design beats raw rendering here.
 
+## 2026-06-28 — Phase 4 Session 4: watchlist UI (toggle + dashboard filter)
+
+**Goal.** Wire the existing-but-never-exercised `/api/v1/watchlist`
+endpoint family into the frontend as a real user flow: a star
+toggle on every company card + on the company-detail header, and a
+simple "All companies / My watchlist" segmented control on the
+dashboard that filters the existing 10-ticker grid client-side.
+Phase 4 Session 3's wrap-up suggested watchlist over news for
+Session 4 because it exercises a new endpoint family and a real
+CRUD flow with optimistic updates, vs. news which is mostly
+read-only rendering.
+
+**Step 0 — live-verify the backend.** The `/watchlist` endpoints
+were built in Phase 1B, untouched and unexercised since. Re-read
+`backend/app/api/v1/intelligence.py` (the watchlist routes live in
+the same router as intelligence reports and alerts — a fact the
+prompt's `backend/app/api/v1/*.py` hint surfaced), then wrote
+`backend/scripts/verify_watchlist_endpoints.py` — a read-write
+smoke test that registers a fresh timestamped user and walks every
+documented status code. **13 PASS / 0 FAIL:**
+
+  - `GET /api/v1/watchlist` empty → 200 `[]`
+  - `POST /api/v1/watchlist {ticker: PPL}` → 201, response body
+    includes the joined `company_name` ("Pakistan Petroleum
+    Limited") from the `Company` table
+  - `POST /api/v1/watchlist {ticker: PPL}` duplicate → 409
+    `{"detail": "'PPL' is already on your watchlist"}`
+  - `POST /api/v1/watchlist {ticker: NOPE}` unknown ticker → 404
+    `{"detail": "Company 'NOPE' not found"}`
+  - `POST /api/v1/watchlist {ticker: mcb}` lowercase → 201 with
+    `"ticker": "MCB"` (backend uppercases via
+    `request.ticker.upper()` in the route handler, confirmed)
+  - `GET /api/v1/watchlist` after 2 adds → 200 `["MCB", "PPL"]`
+  - `DELETE /api/v1/watchlist/PPL` → 200
+    `{"message": "Removed from watchlist"}`
+  - `DELETE /api/v1/watchlist/PPL` already-removed → 404
+    `{"detail": "'PPL' is not on your watchlist"}`
+  - `DELETE /api/v1/watchlist/mcb` lowercase → 200 (backend
+    uppercases the path param too, confirmed)
+  - Final `GET /api/v1/watchlist` → 200 `[]`
+
+All three endpoints worked exactly as documented in the schema /
+code. **No backend changes this session** — the prompt's "if Step 0
+reveals a backend bug, fix it minimally" clause didn't apply.
+
+A side observation: hitting the `/auth/register` endpoint rapidly
+during early curl-based exploration tripped the IP-based rate
+limiter at `backend/app/main.py:147-183` (100 req/min, sliding
+window via Redis with `EXPIRE` reset on every request). Cleared
+via direct `redis-py` against the `rate:127.0.0.1` key on the live
+Upstash instance. Documenting this here since the EXPIRE-on-every-
+request semantics mean the window doesn't actually decay if you
+keep checking it — useful to know if a future session ever sees a
+sticky 429 during local verification.
+
+**Frontend additions.** All five new files; no edits to the five
+protected agent/orchestrator files (verified by `git status` at
+the end of the session):
+
+  - `frontend/src/lib/api/watchlist.ts` — extends the typed
+    `apiRequest<T>()` chokepoint with `getWatchlist`,
+    `addToWatchlist`, `removeFromWatchlist`. The module-level
+    docstring documents the actual edge-case responses so future
+    callers don't have to re-discover them from the backend code.
+  - `frontend/src/lib/watchlist/context.tsx` — `WatchlistProvider`
+    + `useWatchlist()`. Owns shared watchlist state for the whole
+    auth-gated `(app)` route group. Exposes a `Set<string>` of
+    uppercase tickers so the star toggle and the dashboard filter
+    can both do O(1) membership lookups against the same source of
+    truth, no per-component re-fetches. Optimistic update protocol
+    lives entirely here, not in the star: add path optimistically
+    inserts a placeholder row → swaps with the real server payload
+    on 201 → treats 409 as idempotent success (server already had
+    it; refresh to pick up the canonical row) → rolls back the
+    insert on any other ApiError. Remove path optimistically pops
+    the row (stashing it) → treats 404 as idempotent success
+    (server already lacked it) → restores the stashed row on any
+    other ApiError. Both 409-on-add and 404-on-remove being
+    treated as success-equivalents makes the star tap-safe — the
+    same ticker can be tapped twice quickly, or be acted on with
+    stale data after a different tab changed something, and
+    neither of those harmless cases produces an error banner.
+  - `frontend/src/components/watchlist-star.tsx` — `WatchlistStar`,
+    the visual toggle. Two size variants. `card` is small, defaults
+    `stopPropagation=true` because dashboard cards are `<Link>`s
+    wrapping the whole card area and tapping the star inside that
+    link must not also navigate into the detail page. `header` is
+    slightly larger and uses `stopPropagation={false}` since the
+    company-detail header isn't a link. Filled accent (terracotta)
+    for "yours" + outlined muted for "not yours" — deliberately
+    *not* primary teal, since teal is already heavily used on the
+    page via KSE-30 chips, `ConvictionDial`, link hover, and the
+    conviction-score text; using the accent gives the star
+    independent visual identity so a user can scan-and-spot
+    "what's mine" without having to read text. Delegates the
+    entire optimistic-update story to the provider; just calls
+    `toggle()` and waits.
+  - `frontend/src/app/(app)/layout.tsx` (modified) — single
+    `<WatchlistProvider>` wrap around the auth-gated subtree, so
+    the provider only mounts once we know there's an authenticated
+    user. (Mounting it at the root would mean unauthenticated
+    `/login` and `/register` pay for it too, and the `GET
+    /watchlist` call needs a token anyway.)
+  - `frontend/src/components/company-card.tsx` (modified) — added
+    `<WatchlistStar ticker={ticker} variant="card" />` in the
+    card's top-right, beside the existing `ArrowUpRight` link
+    indicator. The dashboard's per-card layout shifted from "icon
+    only" to a small icon group, but the card's other proportions
+    are unchanged.
+  - `frontend/src/app/(app)/companies/[ticker]/page.tsx`
+    (modified) — `<WatchlistStar ticker={company.ticker}
+    variant="header" stopPropagation={false} />` placed directly
+    to the right of the ticker H1, before the existing KSE-30 /
+    KMI-30 chips. The chip row's gap was nudged from `gap-2` to
+    `gap-3` to give the larger header star room.
+  - `frontend/src/app/(app)/dashboard/page.tsx` (modified) — added
+    `DashboardTabs` (the segmented control: "All companies" / "My
+    watchlist", with a tabular-nums count chip on the watchlist
+    pill) and `CompanyGrid` (extracted the existing grid render so
+    it can also handle the empty + loading states of the watchlist
+    tab). Empty watchlist reuses the existing `EmptyState`
+    component the Session 1 "no report yet" CTA established —
+    same visual language, no new pattern introduced. The "Browse
+    all companies" CTA inside the empty state flips the tab via a
+    callback, no scroll / navigation involved.
+  - `frontend/src/lib/api/types.ts` (modified) — added
+    `WatchlistItem` and `AddWatchlistRequest` interfaces mirroring
+    the backend Pydantic schemas.
+
+**Frontend filter is purely client-side.** No new dashboard API
+call. The dashboard already loads the universe + per-ticker detail
+in parallel during mount (Phase 4 Session 1), and the
+`WatchlistProvider`'s `tickerSet` is loaded once on user-auth.
+Switching tabs is a single React state flip — no network traffic,
+no spinner.
+
+**Live verification — Part A (backend flow against real Neon DB).**
+`python backend/scripts/verify_watchlist_flow.py` — 15 PASS / 0
+FAIL. This script walks the same HTTP sequence the frontend takes
+on a real session:
+
+  - register fresh test user (201)
+  - simulate dashboard mount: `GET /companies?limit=50` → 10
+    tickers (correct), `GET /watchlist` → `[]`
+  - simulate star-tap on PPL (add): `POST /watchlist {PPL}` →
+    201, then `GET /watchlist` → membership set `{PPL}`
+  - simulate star-tap on MCB (second add): `POST` → 201,
+    membership set `{MCB, PPL}`
+  - simulate "switch to My watchlist tab": intersect the
+    in-memory universe with the in-memory ticker set → `[MCB,
+    PPL]`, matches expectation
+  - simulate un-star PPL: `DELETE /watchlist/PPL` → 200,
+    membership set `{MCB}`
+  - dry-run 409-on-dup-add idempotence: `POST /watchlist {MCB}`
+    → 409 (the provider's "treat 409 as idempotent success"
+    branch is exercised correctly)
+  - dry-run 404-on-remove-missing idempotence: `DELETE
+    /watchlist/PPL` again → 404 (provider's
+    "treat 404 as idempotent success" branch)
+  - dry-run 404-on-unknown-ticker rollback: `POST /watchlist
+    {ZZZNOPE}` → 404 (provider's actual rollback branch — the
+    optimistic insert gets rolled out and the ApiError is rethrown
+    to the star's onClick handler)
+  - cleanup + final `GET /watchlist` → `[]`
+
+**Live verification — Part B (frontend tsc + Next.js dev server).**
+`cd frontend && npx tsc --noEmit` → exit 0, no output. All new
+types align across the provider, the star, the API client, and
+the dashboard re-render. `npm run dev` boots clean (Next.js 15.5.19
+Ready in 3.7s). `curl -s -o /dev/null -w "%{http_code}"` against
+`/login`, `/dashboard`, `/companies/PPL` returned 200, 200, 200.
+Compile log shows clean compiles for all three route entries with
+no client-side errors.
+
+**Visual UI render NOT independently verified.** Same gap as
+Phase 4 Sessions 2 and 3 — the Claude in Chrome MCP isn't
+connected on this machine. User should open
+`http://localhost:3000/dashboard` after `npm run dev` + login and
+visually confirm:
+
+  1. Each of the 10 company cards on the "All companies" tab shows
+     a star icon in the top-right corner, next to the arrow link
+     indicator. Resting state = muted outline.
+  2. Tapping the star fills it with the terracotta accent
+     *immediately* (the optimistic update), then stays filled
+     once the network call returns. Tapping it again unfills it
+     *immediately*, then stays unfilled.
+  3. Tapping a star does NOT navigate into the company detail
+     page (the `stopPropagation=true` default on the `card`
+     variant prevents the `Link` from firing).
+  4. Switching to "My watchlist" filters the grid to only the
+     ones with filled stars. The count chip on the tab matches
+     the number of cards shown.
+  5. With zero watchlisted tickers, "My watchlist" shows the
+     designed empty state — a star icon, "Your watchlist is
+     empty" headline, the explanatory copy, and a "Browse all
+     companies" CTA that flips the tab back to "All companies"
+     when tapped.
+  6. On `/companies/PPL`, a slightly larger star sits to the
+     right of the "PPL" header H1. Tapping it toggles in
+     real-time, and (because of `stopPropagation={false}`) does
+     not interfere with anything (the header isn't wrapped in a
+     `Link`, so there's nothing to prevent).
+  7. Toggling a star on the dashboard, then visiting the
+     detail page, shows the same fill state (shared via the
+     provider's `tickerSet`). Conversely, toggling on the detail
+     page and going back to the dashboard shows the same fill
+     state on that ticker's card.
+
+**Optimistic-rollback check (per the prompt's explicit ask).**
+The 404-on-unknown-ticker case in `verify_watchlist_flow.py` Step
+9 confirms the backend returns the same status code the
+`WatchlistProvider` checks for (`err.status !== 404` triggers
+rollback). This is harder to reproduce in the actual UI without
+hand-crafting a URL, but it *would* fire if a user opened
+`/companies/SOMETHINGNEW` for a ticker not in the seeded
+`Company` table — the optimistic insert would happen, the POST
+would 404, the provider would roll back the Set, and the star
+would visually revert. This is the rollback branch I'd test
+end-to-end in a connected-browser session by temporarily disabling
+the backend's `/watchlist` POST while keeping the GET working
+(e.g. via a network-blocking devtools rule); the back-end-side
+dry-run above is the most we can verify without that.
+
+**Judgment calls / deviations from the prompt.**
+
+  - *Provider, not per-component state.* The prompt allows for
+    "client-side filtering of data already being fetched for the
+    dashboard if feasible." I went with a shared `WatchlistProvider`
+    rather than dashboard-local state because the star also needs
+    to render on the company-detail page, and split-brain between
+    the two routes (a toggle on detail page not reflected on the
+    dashboard you came from) would be a worse UX than the small
+    cost of one context.
+  - *Optimistic update lives in the provider, not the star.* Keeps
+    the star purely visual and reusable elsewhere later (eg a
+    future news article card with "follow this story" semantics).
+  - *Accent color, not primary.* The page is teal-heavy already;
+    the watchlist star is the user's most personal decision on the
+    page and deserves to scan independently. Picking terracotta
+    leans on the existing palette role (the same role the analyze
+    CTA already uses), so it's not a new palette decision.
+  - *Empty state reuses `EmptyState`.* Same component as the "no
+    report yet" CTA on the company detail page. Consistency over
+    novelty.
+  - *Idempotent 409/404.* The prompt asked for "honest" failure
+    handling; the most honest treatment of "the server already has
+    this" is to silently accept it as success rather than show an
+    error, because the user's intent (have this on my watchlist)
+    is already satisfied. Same logic for 404-on-remove (the
+    user's intent — don't have this on my watchlist — is
+    already satisfied).
+
+**Confirmation that the five protected files were NOT touched.**
+`git status --porcelain` (and a check of the staged diff) at the
+end of the session lists only the new + modified files documented
+above. Neither `trend_analyzer.py`, `news_synthesizer.py`,
+`filing_skeptic.py`, `orchestrator.py`, nor `arbitrator.py`
+appears in the diff. Scoring math is unchanged.
+
+**Docs updated this session:** `CLAUDE.md`'s Current build state
+got a Phase 4 Session 4 line; the Key files map got six new/
+modified entries (`frontend/src/lib/api/watchlist.ts`,
+`frontend/src/lib/watchlist/context.tsx`,
+`frontend/src/components/watchlist-star.tsx`,
+`frontend/src/app/(app)/layout.tsx`,
+`frontend/src/components/company-card.tsx`,
+`backend/scripts/verify_watchlist_endpoints.py`,
+`backend/scripts/verify_watchlist_flow.py`); existing entries for
+`frontend/src/lib/api/client.ts`,
+`frontend/src/app/(app)/dashboard/page.tsx`,
+`frontend/src/app/(app)/companies/[ticker]/page.tsx`, and
+`backend/app/schemas/intelligence.py` were extended to note the
+Session 4 wiring. This BUILD_LOG entry was added.
+
+**What Session 5 should pick up next.** Per Phase 4 Session 1's
+original priority list, the remaining slices are: (a) the **news
+article list** on the company detail page (renders the existing
+`/companies/{ticker}/news` endpoint), (b) **deploy to production**
+on the documented Vercel/Railway/Neon/Upstash stack, and (c) other
+polish items from Session 1's list. The news list is the obvious
+next user-facing slice. Important to remember per
+`docs/KNOWN_ISSUES.md`: news matching is "noisy" (keyword-based,
+false-positive prone — e.g. "petroleum" headlines attach to PPL
+and PSO even when tangential), so the UI needs to surface the
+LLM-judged-relevant set distinctly from the raw keyword-matched
+set — design beats raw rendering here. The other realistic
+session-5 candidate: a small backend-side improvement to expose
+the LLM's per-article relevance judgment via the `/news` endpoint
+so the frontend has something concrete to render that
+distinction against, rather than the frontend having to invent
+the distinction visually from a raw matched-articles list.
+
 <!-- Next entry goes here. Add a new ## dated heading below this line. -->

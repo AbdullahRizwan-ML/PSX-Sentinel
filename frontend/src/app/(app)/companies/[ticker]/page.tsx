@@ -36,6 +36,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorState } from "@/components/error-state";
 import { AnalyzeButton } from "@/components/analyze-button";
 import { PriceChart } from "@/components/price-chart";
+import { WatchlistStar } from "@/components/watchlist-star";
 import { Card, CardContent } from "@/components/ui/card";
 import {
   cn,
@@ -190,10 +191,15 @@ function CompanyHeader({
       <CardContent className="p-0">
         <div className="grid gap-6 p-6 md:grid-cols-[1fr_auto] md:items-center md:gap-10">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <h1 className="font-display text-display-1 leading-none text-foreground">
                 {company.ticker}
               </h1>
+              <WatchlistStar
+                ticker={company.ticker}
+                variant="header"
+                stopPropagation={false}
+              />
               {company.is_kse30 && (
                 <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary">
                   KSE-30

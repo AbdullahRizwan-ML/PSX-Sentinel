@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 
 import { useAuth } from "@/lib/auth/context";
+import { WatchlistProvider } from "@/lib/watchlist/context";
 import { NavBar } from "@/components/nav-bar";
 
 export default function AppLayout({
@@ -33,9 +34,11 @@ export default function AppLayout({
   }
 
   return (
-    <div className="min-h-screen">
-      <NavBar />
-      <main className="container py-8">{children}</main>
-    </div>
+    <WatchlistProvider>
+      <div className="min-h-screen">
+        <NavBar />
+        <main className="container py-8">{children}</main>
+      </div>
+    </WatchlistProvider>
   );
 }

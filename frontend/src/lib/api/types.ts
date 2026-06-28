@@ -151,3 +151,20 @@ export interface ApiErrorBody {
   detail?: string;
   type?: string;
 }
+
+/*
+ * Watchlist item. Mirrors backend WatchlistItemResponse.
+ * company_name is populated from a Company join on the backend.
+ */
+export interface WatchlistItem {
+  id: string;
+  ticker: string;
+  company_name: string | null;
+  added_at: string;
+  notes: string | null;
+}
+
+export interface AddWatchlistRequest {
+  ticker: string;
+  notes?: string;
+}

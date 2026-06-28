@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { TrendingUp, TrendingDown, Activity } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, Star } from "lucide-react";
 
 import {
   getCompanyDetail,
@@ -15,18 +15,24 @@ import type {
 import { ApiError } from "@/lib/api/client";
 
 import { CompanyCard } from "@/components/company-card";
+import { EmptyState } from "@/components/empty-state";
 import { ErrorState } from "@/components/error-state";
-import { formatPct } from "@/lib/utils";
+import { useWatchlist } from "@/lib/watchlist/context";
+import { cn, formatPct } from "@/lib/utils";
 
 interface DashboardData {
   companies: CompanyDetailResponse[];
   market: MarketSummaryResponse | null;
 }
 
+type DashboardTab = "all" | "watchlist";
+
 export default function DashboardPage() {
   const [data, setData] = React.useState<DashboardData | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
+  const [tab, setTab] = React.useState<DashboardTab>("all");
+  const watchlist = useWatchlist();
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -116,31 +122,198 @@ export default function DashboardPage() {
         <>
           {data.market && <MarketStrip market={data.market} />}
 
-          <div className="mt-8 mb-3 flex items-baseline justify-between">
-            <h2 className="font-display text-lg text-foreground">
-              Tracked universe
-            </h2>
-            <span className="text-xs text-muted-foreground">
-              {data.companies.length} companies
+          <div className="mt-8 mb-3 flex items-end justify-between gap-4">
+            <DashboardTabs
+              activeTab={tab}
+              onChange={setTab}
+              watchlistCount={watchlist.tickerSet.size}
+            />
+            <span className="pb-1 text-xs text-muted-foreground">
+              {tab === "all"
+                ? `${data.companies.length} companies`
+                : `${
+                    data.companies.filter((c) =>
+                      watchlist.tickerSet.has(c.ticker.toUpperCase())
+                    ).length
+                  } companies`}
             </span>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {data.companies.map((c) => (
-              <CompanyCard
-                key={c.ticker}
-                ticker={c.ticker}
-                name={c.name}
-                sector={c.sector}
-                isKse30={c.is_kse30}
-                latestPrice={c.latest_price}
-                latestChangePct={c.latest_change_pct}
-                convictionScore={c.latest_conviction_score}
-              />
-            ))}
-          </div>
+          <CompanyGrid
+            tab={tab}
+            companies={data.companies}
+            watchlistSet={watchlist.tickerSet}
+            watchlistReady={watchlist.ready}
+            onSwitchTab={setTab}
+          />
         </>
       )}
+    </div>
+  );
+}
+
+function DashboardTabs({
+  activeTab,
+  onChange,
+  watchlistCount,
+}: {
+  activeTab: DashboardTab;
+  onChange: (next: DashboardTab) => void;
+  watchlistCount: number;
+}) {
+  // Single-row segmented control. Keeps the visual weight low so the
+  // company cards stay the dominant element. Mirrors the existing
+  // "pill" pattern used for KSE-30 chips elsewhere on the page.
+  return (
+    <div
+      role="tablist"
+      aria-label="Dashboard filter"
+      className="inline-flex rounded-full border border-border bg-card p-1 shadow-soft"
+    >
+      <TabButton
+        active={activeTab === "all"}
+        onClick={() => onChange("all")}
+      >
+        All companies
+      </TabButton>
+      <TabButton
+        active={activeTab === "watchlist"}
+        onClick={() => onChange("watchlist")}
+        icon={
+          <Star
+            className={cn(
+              "h-3.5 w-3.5",
+              activeTab === "watchlist" ? "fill-accent text-accent" : ""
+            )}
+            strokeWidth={1.5}
+          />
+        }
+      >
+        My watchlist
+        {watchlistCount > 0 && (
+          <span
+            className={cn(
+              "ml-1.5 rounded-full px-1.5 text-[10px] tabular-nums",
+              activeTab === "watchlist"
+                ? "bg-primary-foreground/15 text-primary-foreground"
+                : "bg-muted text-muted-foreground"
+            )}
+          >
+            {watchlistCount}
+          </span>
+        )}
+      </TabButton>
+    </div>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+  icon,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={cn(
+        "focus-ring inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition-colors",
+        active
+          ? "bg-primary text-primary-foreground shadow-soft"
+          : "text-muted-foreground hover:text-foreground"
+      )}
+    >
+      {icon}
+      {children}
+    </button>
+  );
+}
+
+function CompanyGrid({
+  tab,
+  companies,
+  watchlistSet,
+  watchlistReady,
+  onSwitchTab,
+}: {
+  tab: DashboardTab;
+  companies: CompanyDetailResponse[];
+  watchlistSet: Set<string>;
+  watchlistReady: boolean;
+  onSwitchTab: (next: DashboardTab) => void;
+}) {
+  const filtered =
+    tab === "all"
+      ? companies
+      : companies.filter((c) =>
+          watchlistSet.has(c.ticker.toUpperCase())
+        );
+
+  // Watchlist tab + still loading membership: don't show "empty" yet,
+  // it might just be in-flight. Small inline skeleton instead.
+  if (tab === "watchlist" && !watchlistReady) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="h-[200px] animate-soft-pulse rounded-lg border border-border bg-card"
+          />
+        ))}
+      </div>
+    );
+  }
+
+  // Watchlist tab + empty: this is the designed state the prompt
+  // specifically calls out — reuse the same EmptyState pattern the
+  // company-detail "no report yet" CTA established in Session 1, so
+  // the visual language is consistent across the app.
+  if (tab === "watchlist" && filtered.length === 0) {
+    return (
+      <EmptyState
+        icon={<Star className="h-5 w-5 text-accent" />}
+        title="Your watchlist is empty"
+        description={
+          "Tap the star on any company card or the company detail " +
+          "page to pin it here. Watchlist is per-user, syncs across " +
+          "devices, and is how you'll get focused alerts later."
+        }
+        action={
+          <button
+            type="button"
+            onClick={() => onSwitchTab("all")}
+            className="focus-ring rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Browse all companies
+          </button>
+        }
+        className="py-16"
+      />
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {filtered.map((c) => (
+        <CompanyCard
+          key={c.ticker}
+          ticker={c.ticker}
+          name={c.name}
+          sector={c.sector}
+          isKse30={c.is_kse30}
+          latestPrice={c.latest_price}
+          latestChangePct={c.latest_change_pct}
+          convictionScore={c.latest_conviction_score}
+        />
+      ))}
     </div>
   );
 }

@@ -2,6 +2,7 @@ import Link from "next/link";
 import { ArrowUpRight } from "lucide-react";
 
 import { ConvictionDial } from "@/components/conviction-dial";
+import { WatchlistStar } from "@/components/watchlist-star";
 import { cn, formatPct, formatPrice } from "@/lib/utils";
 
 interface CompanyCardProps {
@@ -58,7 +59,10 @@ export function CompanyCard({
             {sector}
           </p>
         </div>
-        <ArrowUpRight className="h-4 w-4 shrink-0 text-muted-foreground transition-all group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-primary" />
+        <div className="flex items-center gap-1.5">
+          <WatchlistStar ticker={ticker} variant="card" />
+          <ArrowUpRight className="h-4 w-4 shrink-0 text-muted-foreground transition-all group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-primary" />
+        </div>
       </div>
 
       <div className="mt-5 flex items-end justify-between gap-3">
