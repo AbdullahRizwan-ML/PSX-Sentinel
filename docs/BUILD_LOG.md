@@ -2157,3 +2157,54 @@ notional "Session 7". The one loose thread is a *newly identified*
 follow-up, not leftover Phase 4 scope: `PriceChart` dark-mode
 re-theming (it reads CSS vars once at mount and goes stale on live
 toggle — see sub-step 3), filed under "Future / deferred".
+
+---
+
+## 2026-07-04 — Hotfix: PriceChart dark-mode re-theme
+
+Not a Phase/Session — a targeted fix for the follow-up flagged at the end
+of Phase 4 Session 6. Scope was one component (`price-chart.tsx`) plus docs.
+
+**Reported.** After toggling dark→light, the chart's axis / price / volume
+text stayed light-colored and was unreadable against the light card
+background. Manual testing confirmed it as a real, visible bug (the Session
+6 entry had predicted it from the code but the symptom is now demonstrated).
+
+**Two hypotheses checked (didn't assume).** (a) toggle-staleness — the chart
+keeps its mount-time theme colors until reload; (b) a genuinely wrong
+light-mode color value that would break even on a fresh light-mode load.
+Outcome: **(b) ruled out** — a *fresh* page load in light mode rendered dark,
+fully-legible text (the light `--foreground` token `195 30% 12%` is correct
+dark-on-cream). **(a) confirmed as root cause** — the chart resolved its
+colors via `getComputedStyle(document.documentElement)` inside a `useEffect`
+keyed only on `[prices]`; a theme toggle flips the `.dark` class on `<html>`
+but doesn't change `prices`, so the effect never re-ran and
+lightweight-charts (which caches colors internally at creation) kept its
+mount-time palette.
+
+**Fix.** Extracted color resolution into a shared `resolveChartColors()`
+helper so the create path and the re-theme path can't drift. Added a new
+effect keyed on `[theme]` (from `useTheme()`, the Session 6 ThemeProvider)
+that re-themes the **existing** chart in place — `chart.applyOptions()` and
+`series.applyOptions()` for layout `textColor` / pane separators / grid /
+crosshair / the area line color+fill+priceline / both MA line colors, and
+`volumeSeries.setData()` for the volume histogram (its per-bar directional
+tints are baked into each data point, so they must be re-pushed, not
+patched via options). Deliberately **not** a destroy/recreate: updating in
+place also preserves the user's current visible range / zoom across a toggle
+(a recreate would reset it to `fitContent`). A ref guard skips the theme
+effect's first run, since the create effect already builds the chart with
+the current theme's colors. For contrast, `ConvictionDial` never had this
+bug — it passes `hsl(var(--token))` strings into SVG `stroke`/`fill`, which
+the browser re-resolves at paint.
+
+**Verified (Claude Preview MCP, real browser, authed against live
+Neon/Upstash backend).** Screenshotted all four states on `/companies/PPL`:
+fresh load light, fresh load dark, live dark→light toggle, live light→dark
+toggle. Axis / price / volume text legible in every state; the 6M range
+stayed selected across both live toggles (confirming the in-place update
+preserves zoom). Console error-level logs clean after the applyOptions /
+setData calls. `npx tsc --noEmit` exits 0. Port check at end: `netstat -ano`
+showed no listeners on :3000 or :8000 (preview + throwaway-login backend
+both stopped). `docs/KNOWN_ISSUES.md` entry moved from Open to Resolved;
+CLAUDE.md's "Future / deferred" bullet updated to point at the fix.

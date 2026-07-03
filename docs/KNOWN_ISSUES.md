@@ -140,48 +140,52 @@ ENGRO-specific model evaluation less reliable than for other tickers.
 for ENGRO against the PSX DPS endpoint to backfill the missing date range,
 then re-verify row count via direct SQL before rebuilding the ML dataset.
 
-### PriceChart doesn't re-theme on dark-mode toggle
-
-`frontend/src/components/price-chart.tsx` does not re-theme when the user
-toggles dark mode after the chart has already mounted. It keeps whatever
-theme was active at mount time until the page is reloaded.
-
-**Mechanism:** the chart resolves its colors (line/axis/grid/text) by
-reading CSS custom properties via `getComputedStyle(document.documentElement)`
-inside a `useEffect` keyed only on `[prices]`. A theme toggle changes the
-`.dark` class on `<html>` but does not change `prices`, so the effect never
-re-runs, `createChart` is never called again, and the lightweight-charts
-canvas retains its mount-time colors. This is in contrast to `ConvictionDial`
-(`frontend/src/components/conviction-dial.tsx`), which does NOT have the
-problem: it passes `hsl(var(--token))` *strings* straight into SVG
-`stroke`/`fill` attributes, and the browser re-resolves those CSS vars at
-paint time, so the dial re-themes instantly on toggle.
-
-**How it was found:** empirical in-browser test during Phase 4 Session 6
-(2026-07-03, via the Claude Preview MCP). Toggled dark→light with no page
-reload — `ConvictionDial` updated to the correct light-mode colors
-immediately, while `PriceChart` stayed on its mount-time (dark) theme.
-Confirmed correct again only after a full page reload (a fresh mount picks
-up the current theme). Same behaviour reproduced light→dark on
-`/companies/PPL`: post-toggle the chart kept dim light-derived colors
-(dark-teal line, near-invisible dark axis text on the dark card); a reload
-in dark mode rendered it correctly.
-
-**Impact:** cosmetic only. The chart still renders and functions — MA
-overlays, volume bars, range selector, crosshair all work — it just shows
-stale-theme colors until the next reload. No data is wrong.
-
-**Suggested fix (not yet built):** re-read the CSS vars in an effect keyed
-on the current theme value too (not just `[prices]`) — e.g. add the active
-theme to the effect's dependency array, or subscribe to a MutationObserver
-on `<html>`'s class — and recreate (or `applyOptions` on) the chart when it
-changes. This touches `price-chart.tsx` internals, which were explicitly
-protected from modification during Session 6, so it's a candidate for a
-small dedicated session later rather than something to fix inline.
-
 ---
 
 ## Resolved
+
+### PriceChart doesn't re-theme on dark-mode toggle — RESOLVED 2026-07-04
+
+**Was:** `frontend/src/components/price-chart.tsx` kept whatever theme was
+active at mount time until the page was reloaded. The chart resolved its
+colors (line/axis/grid/text) by reading CSS custom properties via
+`getComputedStyle(document.documentElement)` inside a `useEffect` keyed only
+on `[prices]`. A theme toggle changes the `.dark` class on `<html>` but not
+`prices`, so the effect never re-ran and the lightweight-charts canvas
+retained its mount-time colors. The visible symptom (confirmed by manual
+testing before the fix): after a dark→light toggle the axis/price/volume
+text stayed light and was unreadable against the light card background.
+
+**Diagnosis (Phase hotfix, 2026-07-04):** confirmed this was toggle-staleness
+only, NOT a genuinely wrong light-mode color value — a *fresh* page load in
+light mode rendered dark, fully-legible axis/price/volume text (the light
+`--foreground` token `195 30% 12%` is correct dark-on-cream). So only the
+already-mounted-then-toggled path was broken.
+
+**Fix:** `price-chart.tsx` now consumes `useTheme()` and re-themes the
+existing chart **in place** on toggle — no recreate — via a new effect keyed
+on `[theme]`. lightweight-charts v5's `chart.applyOptions()` /
+`series.applyOptions()` update an existing instance's colors in place
+(layout `textColor`, pane separators, grid, crosshair, the area line color +
+fill + price line, and both MA line colors); the volume histogram's per-bar
+colors are baked into each data point, so those are re-pushed via
+`volumeSeries.setData()` with freshly-resolved directional tints. Color
+resolution was extracted into a shared `resolveChartColors()` helper so the
+create path and the re-theme path can't drift. Because the chart is updated
+in place rather than recreated, the user's current visible range / zoom is
+preserved across a toggle (a recreate would have reset it to `fitContent`).
+The first run of the theme effect is skipped (a ref guard) since effect #2
+already created the chart with the current theme's colors.
+
+**Verified (Claude Preview MCP, 2026-07-04):** screenshotted all four states
+on `/companies/PPL` — fresh load light, fresh load dark, live dark→light
+toggle, live light→dark toggle — axis/price/volume text legible in every
+state, 6M range preserved across both live toggles, no console errors.
+`npx tsc --noEmit` exits 0.
+
+For contrast, `ConvictionDial` never had this problem: it passes
+`hsl(var(--token))` *strings* straight into SVG `stroke`/`fill`, which the
+browser re-resolves at paint time, so it re-themes instantly with no JS.
 
 ### Unadjusted stock-split rows in daily_prices — RESOLVED 2026-06-27
 

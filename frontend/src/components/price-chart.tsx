@@ -55,6 +55,7 @@ import { getCompanyPriceHistory } from "@/lib/api/companies";
 import { ApiError } from "@/lib/api/client";
 import type { PricePoint } from "@/lib/api/types";
 import { Card, CardContent } from "@/components/ui/card";
+import { useTheme } from "@/lib/theme/context";
 import { cn } from "@/lib/utils";
 
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -106,6 +107,39 @@ function cssHsla(name: string, alpha: number, fallback: string): string {
   return `hsla(${raw} / ${alpha})`;
 }
 
+/*
+ * Resolve every theme-derived color the chart uses in one pass, reading
+ * the CSS custom properties currently applied to <html>. Called both when
+ * the chart is first created and again whenever the theme toggles, so the
+ * canvas re-themes in place (lightweight-charts caches colors internally,
+ * so a bare CSS-var change is invisible to it until we push new values via
+ * applyOptions / setData — see the theme-reconcile effect below).
+ */
+function resolveChartColors() {
+  return {
+    fgMuted: cssHsla("--foreground", 0.42, "hsla(195 30% 12% / 0.42)"),
+    border: cssHsl("--border", "hsl(195 14% 86%)"),
+    borderFaint: cssHsla("--border", 0.5, "hsla(195 14% 86% / 0.5)"),
+    primary: cssHsl("--primary", "hsl(192 65% 22%)"),
+    primaryFaint: cssHsla("--primary", 0.06, "hsla(192 65% 22% / 0.06)"),
+    accent: cssHsl("--accent", "hsl(14 65% 56%)"),
+    neutral: cssHsl("--neutral", "hsl(38 35% 55%)"),
+    bullishMuted: cssHsla("--bullish", 0.55, "hsla(158 28% 38% / 0.55)"),
+    bearishMuted: cssHsla("--bearish", 0.55, "hsla(6 50% 48% / 0.55)"),
+  };
+}
+
+type ChartColors = ReturnType<typeof resolveChartColors>;
+
+/* Volume bars are tinted by close-vs-previous-close direction. */
+function volumeColor(changeUp: boolean | null, c: ChartColors): string {
+  return changeUp === true
+    ? c.bullishMuted
+    : changeUp === false
+    ? c.bearishMuted
+    : c.fgMuted;
+}
+
 function computeMA(
   points: SeriesPoint[],
   window: number
@@ -138,6 +172,10 @@ export function PriceChart({ ticker, className }: PriceChartProps) {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [range, setRange] = React.useState<Range>(DEFAULT_RANGE);
+
+  // Current theme drives an in-place color re-resolve (see effect #4). The
+  // chart is NOT recreated on toggle, so the visible range is preserved.
+  const { theme } = useTheme();
 
   // 1. Fetch ticker history.
   const load = React.useCallback(async () => {
@@ -189,31 +227,9 @@ export function PriceChart({ ticker, className }: PriceChartProps) {
     if (!containerRef.current) return;
     if (!prices || prices.length === 0) return;
 
-    const fg = cssHsl("--foreground", "hsl(195 30% 12%)");
-    const fgMuted = cssHsla(
-      "--foreground",
-      0.42,
-      "hsla(195 30% 12% / 0.42)"
-    );
-    const border = cssHsl("--border", "hsl(195 14% 86%)");
-    const primary = cssHsl("--primary", "hsl(192 65% 22%)");
-    const primaryFaint = cssHsla(
-      "--primary",
-      0.06,
-      "hsla(192 65% 22% / 0.06)"
-    );
-    const accent = cssHsl("--accent", "hsl(14 65% 56%)");
-    const neutral = cssHsl("--neutral", "hsl(38 35% 55%)");
-    const bullishMuted = cssHsla(
-      "--bullish",
-      0.55,
-      "hsla(158 28% 38% / 0.55)"
-    );
-    const bearishMuted = cssHsla(
-      "--bearish",
-      0.55,
-      "hsla(6 50% 48% / 0.55)"
-    );
+    const colors = resolveChartColors();
+    const { fgMuted, border, borderFaint, primary, primaryFaint, accent, neutral } =
+      colors;
 
     const chart = createChart(containerRef.current, {
       autoSize: true,
@@ -231,7 +247,7 @@ export function PriceChart({ ticker, className }: PriceChartProps) {
       },
       grid: {
         vertLines: { color: "transparent" },
-        horzLines: { color: cssHsla("--border", 0.5, border) },
+        horzLines: { color: borderFaint },
       },
       rightPriceScale: {
         borderVisible: false,
@@ -316,12 +332,7 @@ export function PriceChart({ ticker, className }: PriceChartProps) {
     const volumeData: HistogramData<Time>[] = prices.map((p) => ({
       time: p.date as Time,
       value: p.volume,
-      color:
-        p.changeUp === true
-          ? bullishMuted
-          : p.changeUp === false
-          ? bearishMuted
-          : fgMuted,
+      color: volumeColor(p.changeUp, colors),
     }));
 
     priceSeries.setData(priceData);
@@ -346,7 +357,66 @@ export function PriceChart({ ticker, className }: PriceChartProps) {
     };
   }, [prices]);
 
-  // 3. Apply visible range whenever the user changes it or data arrives.
+  // 3. Re-theme the existing chart in place when the theme toggles.
+  //
+  // lightweight-charts caches its colors internally at creation time, so a
+  // change to the CSS custom properties on <html> (which is all a theme
+  // toggle does) is invisible to an already-mounted chart. We push the
+  // freshly-resolved colors back in via applyOptions (chart + line series)
+  // and setData (volume, whose per-bar colors are baked into the points).
+  // This runs on the theme value from useTheme(), which the ThemeProvider
+  // updates on every toggle. We deliberately do NOT recreate the chart here
+  // so the user's current visible range and zoom are preserved across a
+  // toggle. Skipped on first mount (nothing to re-theme — effect #2 already
+  // created the chart with the current theme's colors).
+  const firstThemeRun = React.useRef(true);
+  React.useEffect(() => {
+    if (firstThemeRun.current) {
+      firstThemeRun.current = false;
+      return;
+    }
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    const colors = resolveChartColors();
+    chart.applyOptions({
+      layout: {
+        textColor: colors.fgMuted,
+        panes: {
+          separatorColor: colors.border,
+          separatorHoverColor: colors.border,
+        },
+      },
+      grid: { horzLines: { color: colors.borderFaint } },
+      crosshair: {
+        vertLine: { color: colors.fgMuted },
+        horzLine: { color: colors.fgMuted },
+      },
+    });
+    priceSeriesRef.current?.applyOptions({
+      lineColor: colors.primary,
+      topColor: colors.primaryFaint,
+      priceLineColor: colors.fgMuted,
+    });
+    ma20SeriesRef.current?.applyOptions({ color: colors.accent });
+    ma50SeriesRef.current?.applyOptions({ color: colors.neutral });
+    if (volumeSeriesRef.current && prices) {
+      volumeSeriesRef.current.setData(
+        prices.map((p) => ({
+          time: p.date as Time,
+          value: p.volume,
+          color: volumeColor(p.changeUp, colors),
+        }))
+      );
+    }
+    // `prices` is intentionally omitted from deps: this effect is for theme
+    // changes only. When `prices` changes, effect #2 recreates the chart
+    // from scratch with current colors, so re-theming here would be
+    // redundant. `prices` is read (not tracked) via the ref-guarded chart.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [theme]);
+
+  // 4. Apply visible range whenever the user changes it or data arrives.
   React.useEffect(() => {
     const chart = chartRef.current;
     if (!chart || !prices || prices.length === 0) return;
