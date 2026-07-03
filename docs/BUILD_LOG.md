@@ -1906,3 +1906,254 @@ the CSS vars — should mostly be a `data-theme="dark"` block in
 globals.css plus the toggle wiring), then mobile nav drawer
 (the NavBar is desktop-only right now, so mobile users get a
 broken header).
+
+## 2026-07-03 — Phase 4 Session 6: batched polish pass (landing / 404 / dark mode / mobile nav)
+
+Last item on Phase 4's original scope. Four small, pure-frontend
+polish sub-steps, done as four independent units. **Zero backend
+changes — the entire code diff is under `frontend/` (+ these docs).**
+None of the five protected agent files were touched. This session
+also finally closed the "no in-browser walkthrough" gap flagged in
+Sessions 2–5: the Claude Preview MCP was available on this machine,
+so every sub-step was verified in a real headless Chromium, not just
+by curl + SSR-shell checks. (Set up via `.claude/launch.json`, left
+untracked as local tooling — see "staging" below.)
+
+Two real bugs were caught *because* of that live browser pass and
+fixed in-session (details under sub-steps 3 and 4).
+
+---
+
+### Sub-step 1 — Unauthenticated landing page
+
+**Files:** `frontend/src/app/page.tsx` (was a one-line
+`redirect("/dashboard")`, now the landing page).
+
+**What.** Client component. Reads `useAuth()` `{user, loading}` — the
+same session check `(app)/layout.tsx` and the login page already use
+(read before writing, not invented) — and `router.replace("/dashboard")`
+for a logged-in visitor; shows a loader while auth resolves; otherwise
+renders a static Karachi-Dusk marketing page. Content: brand, honest
+framing pulled from CLAUDE.md "What this is" (ML price-direction model
++ 4-agent pipeline over KSE-30 — no overclaim), primary CTA to `/login`,
+secondary to `/register`, a small header with brand + theme toggle + Sign
+in link, and the `ConvictionDial` featured decoratively at a static
+`score=58.5` explicitly captioned "Illustrative reading — sign in for
+live scores" (no fabricated per-ticker data). No new deps, no backend
+calls.
+
+**Verified.** `npx tsc --noEmit` -> exit 0. `curl` of
+`http://localhost:3000/` -> **200** unauthenticated. In the real
+browser (tokens cleared): `path=/`, `h1="One conviction score. Four
+agents. Zero noise."`, one button `aria-label="Switch to light mode"`
+present. Redirect path for a logged-in user confirmed by mirroring the
+existing `useAuth`-based pattern (loader shown while `loading || user`,
+`replace("/dashboard")` in effect). Rendered in both light and dark
+palettes (screenshots).
+
+**Judgment calls.** (a) Landing marketing content is client-rendered —
+the SSR HTML is the auth loader shell (because `AuthProvider` starts
+`loading=true`), same client-gated pattern as the login page; content
+hydrates in <1 render for an unauthenticated visitor. Acceptable for a
+client app; noted honestly. (b) Added a theme toggle to the landing
+header even though it has no NavBar, so unauthenticated visitors can
+switch themes.
+
+---
+
+### Sub-step 2 — 404 / not-found page
+
+**Files:** `frontend/src/app/not-found.tsx` (new);
+`frontend/src/app/(app)/companies/[ticker]/page.tsx` (invalid-ticker
+branch).
+
+**What.** Root `not-found.tsx`, styled to match (Fraunces/Inter,
+Karachi-Dusk, brand + theme toggle header). Back-link resolves to
+`/dashboard` (authed) or `/` (not) via `useAuth()`; defaults to `/`
+while auth is still resolving (always safe). **Invalid-ticker case:**
+`/companies/{UNKNOWN}` previously set a generic error string and
+rendered the "Couldn't load company / Try again" `ErrorState` on API
+404 — which reads as a transient failure. Changed the page's existing
+404 branch to set a `notFound` flag and render a dedicated
+"No company found for X" `EmptyState` with a back-to-dashboard link
+instead. Contained to that one branch; the page's other error states
+(non-404 company error, report error) are unchanged.
+
+**Verified.** `npx tsc --noEmit` -> exit 0. `GET /this-does-not-exist`
+-> real HTTP **404** (Next's root `not-found` sets a genuine 404
+status — reported as-observed, not assumed); browser render shows
+"404 / This page wandered off / Back to home". `GET
+/companies/ZZZNOTATICKER` -> **200** at the HTTP layer (it matches the
+dynamic `[ticker]` route, so the page shell serves 200 and the client
+then shows the new not-found `EmptyState` after the API returns 404 for
+the ticker). Both statuses are the honest, expected behavior for a
+client-rendered app; documented rather than glossed.
+
+**Judgment call / scope.** The prompt asked whether improving the
+company-page invalid-ticker state was in scope or a follow-up. Decided
+it was in scope (the prompt calls it out specifically) but kept it
+minimal — one branch, reusing the existing `EmptyState` component — and
+did *not* rewrite the page's other error/loading states. Flagged here
+so the small scope expansion is on record.
+
+---
+
+### Sub-step 3 — Dark mode toggle
+
+**Files:** `frontend/src/lib/theme/context.tsx` (new),
+`frontend/src/components/theme-toggle.tsx` (new),
+`frontend/src/app/layout.tsx` (no-flash script + `suppressHydrationWarning`
++ `ThemeProvider`). `globals.css` and `tailwind.config.ts` were
+**not** changed — the `.dark` token block and `darkMode: ["class"]`
+already existed.
+
+**What.** Chose the `.dark`-class approach (consistent with the
+existing Tailwind config + `.dark {}` block — did *not* introduce a
+second `data-theme` mechanism). `ThemeProvider` toggles `.dark` on
+`<html>`, persists to `localStorage['psx-theme']`, defaults to
+`prefers-color-scheme`. A no-flash inline `<head>` script applies the
+class before hydration; the provider reconciles its React state from
+whatever class the script set. `ThemeToggle` has an icon variant
+(desktop NavBar) and a `labeled` variant (mobile drawer).
+`ThemeProvider` wraps `AuthProvider` at the root.
+
+**Dark-token completeness check (required).** Diffed `:root` vs `.dark`
+in `globals.css`: `.dark` overrides every role token light mode
+defines — background, foreground, card(+fg), surface(+fg), muted(+fg),
+primary(+fg), accent(+fg), bullish(+fg,+muted), bearish(+fg,+muted),
+neutral(+fg), destructive(+fg), border, input, ring, shadow. The only
+`:root` var `.dark` does *not* redefine is `--radius`, which is
+theme-independent and correctly cascades from `:root` (both selectors
+target `<html>`). No token silently falls back to an unreadable
+light-mode value in dark mode.
+
+**Verified.** `npx tsc --noEmit` -> exit 0. In the real browser: toggle
+live-swaps the entire page (chrome, cards, dial) **without a reload**;
+`localStorage['psx-theme']` flips dark<->light and the html class
+follows; the preview browser's `prefers-color-scheme:dark` was picked
+up as the first-visit default (confirming that path). Light + dark
+screenshots captured for landing, dashboard, and company detail.
+
+**Bug caught + fixed (a).** The no-flash script adds `dark` to `<html>`
+before hydration, but the SSR HTML doesn't include it, so React logged
+a hydration mismatch on `<html className>` (visible as a dev-overlay
+"1 Issue"). Fixed with `suppressHydrationWarning` on the `<html>`
+element in `layout.tsx` — the idiomatic next-themes fix; it suppresses
+only that element's attribute diff. After the fix + a clean server
+restart, the browser console shows **no errors** ("No console logs").
+
+**ConvictionDial / PriceChart staleness (required deliverable — NOT
+fixed, per hard rules).**
+- **`ConvictionDial` is toggle-safe.** It passes `hsl(var(--token))`
+  *strings* directly as SVG `stroke`/`fill` attributes; the browser
+  re-resolves those CSS vars at paint, so it re-themes instantly on
+  toggle. Empirically confirmed: after a dark->light toggle *with no
+  reload*, the dial (below the fold on the landing page) rendered the
+  correct light-mode sage needle / cream card / dark "58.5".
+- **`PriceChart` goes stale on toggle.** It reads CSS vars via
+  `getComputedStyle` inside a `useEffect` keyed only on `[prices]`, so
+  a theme toggle doesn't re-run `createChart`; the line/axis/grid/text
+  colors keep the mount-time theme until the next reload/remount.
+  Empirically confirmed on `/companies/PPL`: toggling light->dark left
+  the chart with dim, light-derived colors (dark-teal line, near-
+  invisible dark axis text on the dark card), while a fresh reload in
+  dark mode rendered it correctly (lifted-teal line, legible axis text,
+  vivid green/red volume bars). Left unfixed on purpose (would require
+  editing `price-chart.tsx` internals — explicitly out of scope);
+  filed as a follow-up in CLAUDE.md's "Future / deferred".
+
+**Sequencing judgment (toggle placement vs. mobile nav).** Built the
+theme infra + desktop NavBar toggle in this sub-step, and placed the
+*mobile* toggle inside the drawer as part of sub-step 4 (its natural
+home), rather than deferring to a notional Session 7. So the toggle is
+reachable at every viewport by end of session.
+
+---
+
+### Sub-step 4 — Mobile nav drawer
+
+**Files:** `frontend/src/components/nav-bar.tsx` (rewritten).
+
+**What (after reading the existing component first).** `NavBar`'s nav
+links were `hidden ... sm:flex`, so below `sm` (640px) the Dashboard
+link disappeared (the account dropdown still worked, but the nav did
+not). Rewrote so at `<sm` the desktop nav + account menu are `hidden`
+and a `sm:hidden` hamburger opens a full-height right-side drawer
+containing the same destinations (Dashboard), the `labeled` theme
+toggle, and the account block + Sign out. Drawer: `role="dialog"
+aria-modal`, backdrop (click-to-close), Escape-to-dismiss, body-scroll
+lock, close-button focused on open (basic a11y hygiene, not a full
+focus trap). No new dependencies — plain React state + Tailwind.
+
+**Breakpoint + why.** `sm` (640px), chosen to match the existing nav's
+own responsive boundary (`hidden sm:flex`), so there's one consistent
+mobile/desktop line rather than a second arbitrary one.
+
+**Verified (with rendered className / computed styles, not assumed).**
+`npx tsc --noEmit` -> exit 0. At 375px in the real browser:
+`getComputedStyle(nav).display === "none"` (desktop nav hidden) and
+the hamburger (`aria-label="Open menu"`, className contains
+`sm:hidden`) is `visible`. Opening the drawer: panel present, contents
+correct (Dashboard link active-highlighted, "Dark mode" labeled toggle
+showing "LIGHT", account block Polish Tester + email + FREE, Sign out).
+Escape -> dialog removed and `document.body.style.overflow` restored to
+"" (scroll lock released).
+
+**Bug caught + fixed (b).** First render of the open drawer showed the
+panel see-through and only 64px tall (computed `height: 64px`), with
+the backdrop not covering the screen. Root cause: the drawer was
+rendered *inside* `<header>`, whose `backdrop-blur-md` (a
+`backdrop-filter`) establishes a containing block for `position:fixed`
+descendants — so the panel's `h-full`/`top-0` and the backdrop's
+`inset-0` resolved against the 64px header box, not the viewport. Fixed
+by making `NavBar` return a fragment with `<MobileDrawer>` as a
+*sibling* of `<header>` instead of a child. Re-verified: panel computed
+height 64px -> 812px, opaque `rgb(255,255,255)` background, backdrop
+dims the whole screen, and the `mt-auto` account block correctly pins
+to the drawer bottom. (A one-off `preview_click` timing quirk made the
+first two synthetic clicks not register the React handler; a native
+`.click()` opened it reliably — a tooling artifact, not a component
+bug.)
+
+---
+
+### End-of-session
+
+**Ports.** Literal check at session end (preview + backend both
+stopped):
+
+    $ netstat -ano | grep -E ':3000\s|:8000\s' | grep -i LISTENING
+    (no LISTENING sockets on :3000 or :8000)
+    $ Get-CimInstance node.exe | ... grep -i 'next|psx|3000'
+    No lingering next/psx node processes
+
+The throwaway-login backend (uvicorn :8000, used to exercise the authed
+dashboard/company routes in-browser) and the preview Next server were
+both terminated and confirmed gone.
+
+**Staging.** Explicit per-file, no `git add .`. Staged: the 4 modified
+files (`frontend/src/app/(app)/companies/[ticker]/page.tsx`,
+`frontend/src/app/layout.tsx`, `frontend/src/app/page.tsx`,
+`frontend/src/components/nav-bar.tsx`), the 3 new files
+(`frontend/src/app/not-found.tsx`,
+`frontend/src/components/theme-toggle.tsx`,
+`frontend/src/lib/theme/context.tsx`), plus `CLAUDE.md` and this
+`docs/BUILD_LOG.md`. **Deliberately NOT staged:** `.claude/launch.json`
+(local Claude-Preview tooling I created to run the in-browser
+verification — not application code; left untracked). `git status`
+before staging showed no stray `node_modules/`, `.next/`, or
+`.env.local`.
+
+**Protected files.** `git diff --stat` confirms the working diff is
+only the frontend files + the two docs. None of
+`backend/app/agents/{trend_analyzer,news_synthesizer,filing_skeptic,
+orchestrator,arbitrator}.py` appear — the entire code diff is under
+`frontend/`.
+
+**Phase 4 scope.** Phase 4's original scope had this batched polish
+pass (landing / 404 / dark mode / mobile nav) as its last remaining
+item. This session closes it out. No sub-step was deferred to a
+notional "Session 7". The one loose thread is a *newly identified*
+follow-up, not leftover Phase 4 scope: `PriceChart` dark-mode
+re-theming (it reads CSS vars once at mount and goes stale on live
+toggle — see sub-step 3), filed under "Future / deferred".

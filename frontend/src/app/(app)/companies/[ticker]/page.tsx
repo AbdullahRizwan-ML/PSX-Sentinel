@@ -16,6 +16,7 @@ import {
   FileText,
   Sparkles,
   Clock,
+  SearchX,
 } from "lucide-react";
 
 import {
@@ -59,12 +60,14 @@ export default function CompanyDetailPage() {
   const [data, setData] = React.useState<PageData | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
+  const [notFound, setNotFound] = React.useState(false);
   const [reportError, setReportError] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
     if (!ticker) return;
     setLoading(true);
     setError(null);
+    setNotFound(false);
     setReportError(null);
     try {
       const company = await getCompanyDetail(ticker);
@@ -84,7 +87,10 @@ export default function CompanyDetailPage() {
       setData({ company, report });
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
-        setError(`No company found with ticker "${ticker}".`);
+        // Unknown ticker — a distinct "not found" state (not a transient
+        // failure), so we render a dedicated card with a way back to the
+        // dashboard rather than a "try again" retry prompt.
+        setNotFound(true);
       } else if (err instanceof ApiError) {
         setError(err.message);
       } else {
@@ -111,7 +117,29 @@ export default function CompanyDetailPage() {
 
       {loading && <DetailSkeleton />}
 
-      {!loading && error && (
+      {!loading && notFound && (
+        <EmptyState
+          icon={<SearchX className="h-5 w-5 text-primary" />}
+          title={`No company found for "${ticker}"`}
+          description={
+            "PSX Sentinel currently covers the KSE-30 universe. This " +
+            "ticker isn't one of them — head back to the dashboard for " +
+            "the full list of tracked companies."
+          }
+          action={
+            <Link
+              href="/dashboard"
+              className="focus-ring inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-soft transition-colors hover:bg-primary/90"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Back to dashboard
+            </Link>
+          }
+          className="py-16"
+        />
+      )}
+
+      {!loading && !notFound && error && (
         <ErrorState
           title="Couldn't load company"
           message={error}
@@ -119,7 +147,7 @@ export default function CompanyDetailPage() {
         />
       )}
 
-      {!loading && !error && data && (
+      {!loading && !notFound && !error && data && (
         <>
           <CompanyHeader company={data.company} report={data.report} />
 

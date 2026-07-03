@@ -29,3 +29,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local Claude Code tooling (e.g. .claude/launch.json — preview-server config)
+.claude/
