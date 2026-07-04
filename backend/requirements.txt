@@ -23,6 +23,12 @@ pyarrow==18.1.0
 xgboost==2.1.3
 lightgbm==4.5.0
 scikit-learn==1.5.2
+# Phase 5 Session 1 — offline backtest harness (scripts/backtest_xgboost.py).
+# vectorbt 1.0.0 pulls numba>=0.66 / llvmlite 0.48, which DO support the
+# existing numpy==2.1.3 pin (numpy was NOT downgraded on install — verified).
+# It also pulls matplotlib/plotly/ipywidgets as transitive deps; those are
+# only used by vectorbt's optional plotting and are not imported by the app.
+vectorbt==1.0.0
 loguru==0.7.3
 apscheduler==3.10.4
 httpx==0.28.0

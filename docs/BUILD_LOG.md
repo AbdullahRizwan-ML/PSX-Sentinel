@@ -2208,3 +2208,82 @@ setData calls. `npx tsc --noEmit` exits 0. Port check at end: `netstat -ano`
 showed no listeners on :3000 or :8000 (preview + throwaway-login backend
 both stopped). `docs/KNOWN_ISSUES.md` entry moved from Open to Resolved;
 CLAUDE.md's "Future / deferred" bullet updated to point at the fix.
+
+---
+
+## 2026-07-04 — Phase 5 Session 1: first-ever backtest of the XGBoost model
+
+Opens Phase 5 ("Signal validation & data depth"). Until now the model's
+only validation was 3-class test accuracy (39.34% vs 33.33%). This session
+answers the real question — *would trading on it have made money, net of
+PSX costs?* — with a `vectorbt`-based, read-only, test-split-only backtest
+(`backend/scripts/backtest_xgboost.py`). No retrain, no DB writes, no
+protected-file changes.
+
+**Result (headline, 9-ticker equal-weight sleeve, shared window
+2025-10-24 → 2026-05-29, net of 0.30% round-trip commission, pre-CGT):**
+
+| Strategy | Total ret | Ann. Sharpe | Max DD | Win rate | Trades | vs B&H ret |
+|---|---:|---:|---:|---:|---:|---:|
+| Ungated (long every UP) | +5.10% | +0.43 | −21.30% | 63.49% | 63 | B&H +3.33% |
+| Gated (max_prob > 0.55) | +2.35% | +0.42 | −5.70% | 63.64% | 22 | B&H +3.33% |
+| Buy & Hold (benchmark) | +3.33% | +0.33 | −24.41% | n/a | 0 closed | — |
+
+Post-CGT (15% on net gain): ungated +4.33%, gated +2.00%, B&H +2.83%.
+Discount-broker sensitivity (0.05%/side): ungated +6.52% / Sharpe 0.50.
+Full per-ticker table and the ENGRO-standalone line live in the new
+`docs/BACKTEST_RESULTS.md`.
+
+**Honest read:** the ungated signal beat buy-and-hold on both return and
+Sharpe over this ~7-month out-of-sample window after a deliberately
+expensive cost assumption — a real but *thin* edge (Sharpe well under 1,
+drawdown nearly as deep as B&H, per-ticker spread PSO −20% to UBL +24%).
+The gated version's value is risk reduction (−5.7% DD from sitting in cash),
+not return. One window, one universe, one model — validates the signal is
+"not worthless after costs", does **not** establish a deployable strategy.
+
+**Cost assumption (documented, not arbitrary):** 0.15% commission/side
+(0.30% round-trip) bundling PSX brokerage + FED/sales-tax-on-commission +
+CDC/SECP/PSX/NCCPL levies, deliberately on the expensive side; plus 15% CGT
+on net realised gain applied post-hoc at sleeve level (filer, <12-month
+hold), applied identically to B&H. Slippage not modelled (close-to-close
+fills) — flagged as optimistic. See `BACKTEST_RESULTS.md` and the script
+docstring for sourcing.
+
+**No-leakage, proven not assumed:** the harness reads only `test.parquet`
+and asserts `test_min > val_max` per ticker; those boundaries were pasted
+side-by-side with `verify_dataset.py`'s independently-derived split and
+match exactly for all 10 tickers (e.g. PPL val_max 2025-10-23 / test_min
+2025-10-24). The model's 5-day forward *label* is never a trading input —
+trades come purely from `predict_proba` of the backward-looking features.
+
+**Judgment calls:** (1) long-only (retail PSX shorting impractical);
+(2) "regime hold" — one long position while the model stays bullish, exit
+on flip — instead of overlapping fixed-5-day holds, because per-signal
+5-day holds would need concurrent same-ticker positions (pyramiding), which
+the "no leverage / one position" rule forbids; (3) ENGRO quarantined from
+the sleeve (its 2024 test window is disjoint from the other 9's 2025-26
+window — stitching it in would inject ~10 months of flat-cash days and
+distort Sharpe) but still fully reported per-ticker; (4) gated `max_prob >
+0.55` mirrors `Arbitrator.ML_GATE` — 105 of 1,426 test rows clear it (vs
+zero on the single-latest-day production probe, because the test set spans
+1,426 historical days).
+
+**Dependency:** added `vectorbt==1.0.0` to `backend/requirements.txt`. It
+pulls numba≥0.66 / llvmlite 0.48, which support the existing `numpy==2.1.3`
+pin — **numpy was NOT downgraded** (verified: numpy/pandas/xgboost/sklearn
+all still import at their pinned versions). Transitive matplotlib/plotly/
+ipywidgets are vectorbt's optional plotting deps, not imported by the app.
+
+**Results home (proposed + acted on):** created `docs/BACKTEST_RESULTS.md`
+as the durable home for backtests (model artifact + window + costs + literal
+numbers, append-on-retrain), with a one-paragraph headline mirrored here in
+the Build Log. Rationale: backtest tables are too big/tabular to live well
+in the append-only prose log, and will be re-run on every future retrain —
+they deserve a diffable canonical file.
+
+**Protected files untouched:** `git diff --stat` — the diff is
+`scripts/backtest_xgboost.py` (new), `requirements.txt`, `CLAUDE.md`,
+`docs/BUILD_LOG.md`, `docs/BACKTEST_RESULTS.md`. None of
+`trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
+`orchestrator.py` / `arbitrator.py`.
