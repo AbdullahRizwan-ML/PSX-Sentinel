@@ -288,6 +288,7 @@ class AnnouncementCollector(BaseCollector):
                     title=title,
                     category=category,
                     pdf_url=pdf_url,
+                    source="psx_dps",
                 )
                 self.db.add(announcement)
                 inserted += 1

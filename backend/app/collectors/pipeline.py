@@ -9,10 +9,12 @@ Called by:
 
 Execution sequence:
 1. Seed companies (idempotent — skips existing)
-2. Collect prices (PriceCollector via Yahoo Finance)
+2. Collect prices (PriceCollector via PSX DPS)
 3. Collect announcements (AnnouncementCollector via PSX portal)
 4. Parse PDFs (PDFParser for quarterly result documents)
 5. Collect news (NewsCollector via RSS feeds)
+6. Collect fundamentals + announcement mirror (FundamentalsCollector
+   via PSX Terminal)
 
 Each stage runs independently — a failure in one stage does NOT
 prevent subsequent stages from executing. The pipeline always
@@ -23,6 +25,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.collectors.announcement_collector import AnnouncementCollector
+from app.collectors.fundamentals_collector import FundamentalsCollector
 from app.collectors.news_collector import NewsCollector
 from app.collectors.pdf_parser import PDFParser
 from app.collectors.price_collector import PriceCollector
@@ -50,6 +53,7 @@ async def run_full_pipeline(
             "announcements": {...},
             "pdfs": {...},
             "news": {...},
+            "fundamentals": {...},
         }
     """
     settings = get_settings()
@@ -69,46 +73,55 @@ async def run_full_pipeline(
     try:
         seeded = await seed_companies(db)
         results["seed"] = {"records_inserted": seeded}
-        logger.info(f"Step 1/5 - Seed complete: {seeded} companies inserted")
+        logger.info(f"Step 1/6 - Seed complete: {seeded} companies inserted")
     except Exception as e:
-        logger.error(f"Step 1/5 - Seed failed: {type(e).__name__}: {e}")
+        logger.error(f"Step 1/6 - Seed failed: {type(e).__name__}: {e}")
         results["seed"] = {"error": str(e)}
 
     # ── Step 2: Collect prices ────────────────────────────────────────────
     try:
         price_result = await PriceCollector(db).run_safe(tickers)
         results["prices"] = price_result
-        logger.info(f"Step 2/5 - Prices complete: {price_result}")
+        logger.info(f"Step 2/6 - Prices complete: {price_result}")
     except Exception as e:
-        logger.error(f"Step 2/5 - Price collection failed: {e}")
+        logger.error(f"Step 2/6 - Price collection failed: {e}")
         results["prices"] = {"error": str(e)}
 
     # ── Step 3: Collect announcements ─────────────────────────────────────
     try:
         ann_result = await AnnouncementCollector(db).run_safe(tickers)
         results["announcements"] = ann_result
-        logger.info(f"Step 3/5 - Announcements complete: {ann_result}")
+        logger.info(f"Step 3/6 - Announcements complete: {ann_result}")
     except Exception as e:
-        logger.error(f"Step 3/5 - Announcement collection failed: {e}")
+        logger.error(f"Step 3/6 - Announcement collection failed: {e}")
         results["announcements"] = {"error": str(e)}
 
     # ── Step 4: Parse quarterly result PDFs ───────────────────────────────
     try:
         pdf_result = await PDFParser(db).run_safe(tickers)
         results["pdfs"] = pdf_result
-        logger.info(f"Step 4/5 - PDF parsing complete: {pdf_result}")
+        logger.info(f"Step 4/6 - PDF parsing complete: {pdf_result}")
     except Exception as e:
-        logger.error(f"Step 4/5 - PDF parsing failed: {e}")
+        logger.error(f"Step 4/6 - PDF parsing failed: {e}")
         results["pdfs"] = {"error": str(e)}
 
     # ── Step 5: Collect news ──────────────────────────────────────────────
     try:
         news_result = await NewsCollector(db).run_safe(tickers)
         results["news"] = news_result
-        logger.info(f"Step 5/5 - News complete: {news_result}")
+        logger.info(f"Step 5/6 - News complete: {news_result}")
     except Exception as e:
-        logger.error(f"Step 5/5 - News collection failed: {e}")
+        logger.error(f"Step 5/6 - News collection failed: {e}")
         results["news"] = {"error": str(e)}
+
+    # ── Step 6: Collect fundamentals + PSX Terminal announcement mirror ──
+    try:
+        fundamentals_result = await FundamentalsCollector(db).run_safe(tickers)
+        results["fundamentals"] = fundamentals_result
+        logger.info(f"Step 6/6 - Fundamentals complete: {fundamentals_result}")
+    except Exception as e:
+        logger.error(f"Step 6/6 - Fundamentals collection failed: {e}")
+        results["fundamentals"] = {"error": str(e)}
 
     logger.info("Full pipeline complete")
     logger.info(f"Pipeline results: {results}")

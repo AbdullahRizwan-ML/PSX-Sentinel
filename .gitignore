@@ -19,9 +19,6 @@ backend/logs/
 # ML training artifacts (generated locally by scripts/build_ml_dataset.py)
 backend/ml_data/
 
-# Alembic auto-generated migrations
-backend/alembic/versions/*.py
-
 # OS
 .DS_Store
 Thumbs.db

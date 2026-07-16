@@ -10,6 +10,7 @@ Usage from the backend/ directory:
     python scripts/run_pipeline.py --seed-only
     python scripts/run_pipeline.py --prices-only
     python scripts/run_pipeline.py --news-only
+    python scripts/run_pipeline.py --fundamentals-only
 """
 
 import argparse
@@ -28,6 +29,7 @@ async def main(
     seed_only: bool = False,
     prices_only: bool = False,
     news_only: bool = False,
+    fundamentals_only: bool = False,
 ) -> None:
     """
     Main async entry point for the pipeline runner.
@@ -73,6 +75,20 @@ async def main(
 
             result = await NewsCollector(db).run_safe(tickers)
             logger.info(f"News collection result: {result}")
+            return
+
+        # ── Fundamentals only ─────────────────────────────────────────
+        if fundamentals_only:
+            from app.collectors.seed_data import seed_companies
+
+            await seed_companies(db)  # Ensure companies exist
+
+            from app.collectors.fundamentals_collector import (
+                FundamentalsCollector,
+            )
+
+            result = await FundamentalsCollector(db).run_safe(tickers)
+            logger.info(f"Fundamentals collection result: {result}")
             return
 
         # ── Full pipeline ─────────────────────────────────────────────
@@ -121,6 +137,14 @@ Examples:
         action="store_true",
         help="Only collect news data (seeds companies first)",
     )
+    parser.add_argument(
+        "--fundamentals-only",
+        action="store_true",
+        help=(
+            "Only collect fundamentals + PSX Terminal announcements "
+            "(seeds companies first)"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -136,7 +160,7 @@ Examples:
 
     print(f"PSX Sentinel Pipeline Runner")
     print(f"Tickers: {', '.join(tickers)}")
-    print(f"Mode: {'seed-only' if args.seed_only else 'prices-only' if args.prices_only else 'news-only' if args.news_only else 'full pipeline'}")
+    print(f"Mode: {'seed-only' if args.seed_only else 'prices-only' if args.prices_only else 'news-only' if args.news_only else 'fundamentals-only' if args.fundamentals_only else 'full pipeline'}")
     print()
 
     asyncio.run(
@@ -145,5 +169,6 @@ Examples:
             seed_only=args.seed_only,
             prices_only=args.prices_only,
             news_only=args.news_only,
+            fundamentals_only=args.fundamentals_only,
         )
     )

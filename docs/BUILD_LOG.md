@@ -2287,3 +2287,175 @@ they deserve a diffable canonical file.
 `docs/BUILD_LOG.md`, `docs/BACKTEST_RESULTS.md`. None of
 `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
 `orchestrator.py` / `arbitrator.py`.
+
+
+---
+
+## 2026-07-17 — Phase 5 Session 2: PSX Terminal integration (fundamentals + announcements mirror)
+
+Second item in Phase 5 ("Signal validation & data depth"). A deliberately
+double-sized session: new data client + DB layer + new collector + live
+verification, all in one pass. Data-collection only — nothing was wired
+into AgentContext, any agent prompt, or the conviction formula; the new
+data ends this session sitting verified in the DB, deliberately
+unconnected to scoring. No LLM calls anywhere in this path.
+
+### What the probe actually found (don't trust the docs, verify the API)
+
+The session prompt said to verify PSX Terminal's endpoints live before
+writing code. Good thing, because the documented picture is gone:
+
+- **The GitHub repo (`mumtazkahn/psx-terminal`) 404s** — deleted or
+  private. Only search-engine caches remember the endpoint list.
+- **The documented per-symbol REST endpoints are dead.**
+  `/api/fundamentals/{S}`, `/api/companies/{S}`, `/api/dividends/{S}`,
+  `/api/ticks/{M}/{S}`, `/api/announcements/{S}` all get their TCP
+  connection killed server-side without a response. Proven not to be a
+  client/TLS/header problem: identical failure from curl (schannel),
+  httpx, and — decisively — `fetch()` executed **from the site's own
+  origin inside a real browser** (Claude Browser pane). The site's own
+  frontend never calls these routes; it is SvelteKit SSR + WebSocket.
+  `psxterminal.com` now carries a commercial operator (Runtime
+  Technologies (SMC-PRIVATE) LIMITED), sign-in, and a refund policy.
+- **Still alive, no auth:** `GET /api/symbols` (full symbol list,
+  `{"success":true,"data":[...]}`) and `GET /api/status`.
+- **The working data channel is SvelteKit's `__data.json`** — the SSR
+  payload each page renders from, in devalue serialization (flat array,
+  objects hold integer indices into the same array):
+  - `/financials/{S}/__data.json` → `overview` (valuation, shares,
+    dividends, margins) + `ttm` (incl. `price_earnings`) + full FY/FQ
+    statements. PPL cross-checked against the rendered page: pe 7.677 ↔
+    "7.68", div yield 3.79%, mkt cap 610.0B, all match.
+  - `/symbol/{S}/__data.json?market=REG` → `companyData`,
+    `dividendsData` (history), `announcementsData` (latest ~10 per
+    symbol, each with title/date/type and a `pdf_id` URL pointing at the
+    real `dps.psx.com.pk/download/document/*.pdf` — i.e. an actual
+    PUCARS-mirror for announcement metadata + PDF links).
+  - `?x-sveltekit-invalidated=01` makes the server skip the shared
+    layout node (~350KB of market-wide data): the symbol payload drops
+    to ~19KB. Politer and faster; used everywhere.
+- **ENGRO is not in their universe — only ENGROH.** Chased this into our
+  own DB: ENGRO's `daily_prices` run 2021-06-07 → **2025-01-03, then
+  stop**. The "ENGRO short history" known issue's root cause was wrong
+  (it blamed an unfilled backfill gap) — ENGRO stopped trading (folded
+  into Engro Holdings). KNOWN_ISSUES entry rewritten; universe decision
+  (migrate to ENGROH vs drop) deferred to its own session.
+
+### Built
+
+- `backend/app/integrations/psx_terminal_client.py` (+ package
+  `__init__.py`) — async httpx client, one method per endpoint used:
+  `get_symbols()`, `get_fundamentals(symbol)`, `get_symbol_data(symbol)`.
+  Contains the devalue parser. Polite posture: 30s timeout, connection
+  reuse via `async with`, 2 requests per ticker per run, and the caller
+  sleeps between tickers. Every failure path returns None + a logged
+  warning (never raises); missing fields are listed per ticker in a
+  `missing_fields` key and logged — never defaulted to something
+  plausible-looking.
+- `backend/app/db/models.py` — new `CompanyFundamentals` (UUID pk,
+  ticker FK + unique, nullable pe_ratio / dividend_yield /
+  market_cap_pkr / free_float_pct, last_updated, source default
+  "psx_terminal"); new nullable `Announcement.source` column so
+  PSX-Terminal-mirrored rows are distinguishable from the legacy portal
+  scraper (which now stamps `psx_dps` — 1-line change) and any future
+  PUCARS-direct scraper.
+- `backend/alembic/versions/93dd6a13c006_company_fundamentals_table_.py`
+  — the project's **first-ever Alembic revision** (the live schema
+  predates it via `create_all`). Hand-written delta only: create
+  `company_fundamentals`, add `announcements.source`. Applied to live
+  Neon (`alembic upgrade head`) and verified via direct
+  information_schema/pg_constraint SQL: all 8 columns, pkey, unique
+  (ticker), FK present; `alembic_version` stamped `93dd6a13c006`.
+  **Side discovery:** `.gitignore` had `backend/alembic/versions/*.py`
+  (Phase 1B scaffolding) — migrations were being *gitignored*. Rule
+  removed; migrations are schema history and must be tracked.
+- `backend/app/collectors/fundamentals_collector.py` —
+  `FundamentalsCollector(BaseCollector)`, `name="fundamentals_collector"`.
+  Per ticker: fundamentals upsert (one row per ticker) + announcements
+  insert with ticker+title+date dedup (range match on `announced_at`, so
+  a changed posting_time can't duplicate). One symbols-list call up
+  front cheaply skips tickers PSX Terminal doesn't list (ENGRO) without
+  burning per-ticker requests. Sleeps mirror announcement_collector
+  (3.0s between tickers, 1.0s between the two per-ticker fetches).
+  Category mapping reuses `AnnouncementCollector.CATEGORY_MAP` plus a
+  small observed-phrasing overlay ("transmission of accounts" →
+  QUARTERLY_RESULT, "disclosure of interest" → MATERIAL_INFO).
+- Wiring: `pipeline.py` Step 6/6 (own `run_safe`, own PipelineRun row,
+  failure-isolated like every other stage); `run_pipeline.py`
+  `--fundamentals-only`.
+- `backend/scripts/verify_psx_terminal.py` — runs the collector for real
+  then verifies via a **separate sync psycopg2 connection with raw SQL**
+  (not the ORM session that wrote the rows): per-ticker field dump with
+  NULLs flagged, type + plausibility checks (pe in (0,100), yield in
+  [0,30), mktcap > 1e9, float in (0,100]), announcement counts/date
+  ranges/pdf coverage, PipelineRun status, and `--dedup-check` (second
+  live run must insert 0 announcements).
+
+### Live verification (real API, real Neon, direct SQL)
+
+Run 1: `{'tickers_processed': 9, 'tickers_failed': 1,
+'records_inserted': 93, 'fundamentals_upserted': 9,
+'announcements_inserted': 84}` (the 1 failure is ENGRO, expected).
+Run 2 (dedup check): `announcements_inserted: 0` — **dedup holds**.
+PipelineRun: `status=PARTIAL processed=9 failed=1` (honest — ENGRO).
+
+Per-ticker `company_fundamentals` (direct SQL; full precision in the DB):
+
+| Ticker | P/E (TTM) | Div yield % | Mkt cap PKR | Free float % |
+|---|---:|---:|---:|---:|
+| ENGRO | — no row (not listed on PSX Terminal; ENGROH only) | | | |
+| LUCK | 7.78 | 0.0 (suspect) | 648.2B | **NULL** |
+| OGDC | 8.83 | 4.98 | 1,374.1B | 21.69 |
+| PPL | 7.68 | 3.79 | 610.0B | 25.14 |
+| MCB | 8.29 | 9.05 | 471.3B | 30.74 |
+| HBL | 6.60 | 7.09 | 437.2B | 34.89 |
+| UBL | 8.14 | 6.92 | 1,158.4B | 33.52 |
+| MARI | 11.45 | 0.0 (suspect) | 786.2B | 18.93 |
+| PSO | 3.78 | 2.85 | 164.6B | 74.49 |
+| MEBL | 10.52 | 5.30 | 968.6B | 25.52 |
+
+Verifier result: **0 failed, 3 warnings** (ENGRO no-row ×2, LUCK NULL
+free float — all expected and documented). All present values are real
+floats in plausible ranges.
+
+Announcements mirror (84 rows, all `source='psx_terminal'`): LUCK 10,
+OGDC 10, PPL 10, MCB 10, HBL 9, UBL 10, MARI 10, PSO 10, MEBL 5; pdf_url
+coverage 3/10 (UBL) to 10/10. MEBL's 5-of-10 was chased to the source:
+six same-title "Disclosure of Interest…" filings on 2026-07-15 collapse
+to one row under the specified title+date dedup key (confirmed by
+re-fetching the raw feed). LUCK's yield-0.0 and NULL float were also
+confirmed *at the API*, not parse bugs. All gaps recorded in
+KNOWN_ISSUES, not smoothed over.
+
+### Judgment calls
+
+1. **No ENGRO→ENGROH aliasing.** They are different corporate entities;
+   silently mapping would attach Engro Holdings fundamentals to a ticker
+   whose price series died in Jan 2025. Flagged for a dedicated session.
+2. **Dividends history fetched but not persisted** — no table for it was
+   in scope; the client exposes it (`get_symbol_data()['dividends']`)
+   so a future session can add a model without touching the client.
+3. **dividend_yield stored as the source's literal 0.0** for LUCK/MARI
+   rather than coerced to NULL — we store what the source said and
+   document the suspicion, rather than editorializing data.
+4. **`.gitignore` fix folded in** (migrations were ignored) — small,
+   but leaving it would have shipped a phantom migration.
+
+### Files touched
+
+New: `backend/app/integrations/__init__.py`,
+`backend/app/integrations/psx_terminal_client.py`,
+`backend/app/collectors/fundamentals_collector.py`,
+`backend/alembic/versions/93dd6a13c006_company_fundamentals_table_.py`,
+`backend/scripts/verify_psx_terminal.py`.
+Modified: `backend/app/db/models.py`, `backend/app/collectors/pipeline.py`
+(step 6 + renumbered log strings), `backend/scripts/run_pipeline.py`
+(`--fundamentals-only`), `backend/app/collectors/announcement_collector.py`
+(stamps `source="psx_dps"`, 1 line), `.gitignore`, `CLAUDE.md`,
+`docs/KNOWN_ISSUES.md`, this file.
+
+**Protected files untouched:** pre-docs `git diff --stat` showed exactly
+`announcement_collector.py (+1)`, `pipeline.py`, `models.py`,
+`run_pipeline.py` modified + the new files above. None of
+`trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
+`orchestrator.py` / `arbitrator.py` appear in the diff.

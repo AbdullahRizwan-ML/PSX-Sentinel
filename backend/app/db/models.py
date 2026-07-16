@@ -118,6 +118,9 @@ class Company(Base):
     prices: Mapped[list["DailyPrice"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
+    fundamentals: Mapped[Optional["CompanyFundamentals"]] = relationship(
+        back_populates="company", uselist=False, cascade="all, delete-orphan"
+    )
     announcements: Mapped[list["Announcement"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
@@ -179,6 +182,60 @@ class DailyPrice(Base):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 3b. CompanyFundamentals
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CompanyFundamentals(Base):
+    """
+    Point-in-time fundamentals snapshot for a company, one row per ticker
+    (upserted on each collector run). Sourced from PSX Terminal
+    (psxterminal.com) — a free single-maintainer mirror, so every metric
+    is nullable: a ticker the source doesn't cover (e.g. ENGRO, which
+    PSX Terminal only lists as post-merger ENGROH) simply has no row,
+    and a covered ticker may still be missing individual fields.
+
+    dividend_yield and free_float_pct are percentages (3.79 = 3.79%);
+    market_cap_pkr is full rupees.
+    """
+    __tablename__ = "company_fundamentals"
+    __table_args__ = (
+        UniqueConstraint("ticker", name="uq_fundamentals_ticker"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    ticker: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.ticker"), nullable=False, index=True
+    )
+    pe_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    dividend_yield: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    market_cap_pkr: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    free_float_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="psx_terminal"
+    )
+
+    # Relationships
+    company: Mapped["Company"] = relationship(back_populates="fundamentals")
+
+    def __repr__(self) -> str:
+        return (
+            f"<CompanyFundamentals {self.ticker} pe={self.pe_ratio} "
+            f"yield={self.dividend_yield}>"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 4. Announcement
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -208,6 +265,9 @@ class Announcement(Base):
         String(500), nullable=True
     )
     pdf_parsed: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True
+    )  # psx_dps (portal scraper), psx_terminal (mirror), future: pucars
     fiscal_quarter: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     fiscal_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

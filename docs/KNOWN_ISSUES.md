@@ -24,6 +24,18 @@ to pull quarterly result PDFs directly. This is higher-effort than the
 current scrapers (needs a real headless browser, not just `httpx`) and was 
 deliberately deferred rather than rushed.
 
+**Update (Phase 5 Session 2, 2026-07-17):** announcements are now *mirrored*
+from PSX Terminal (see the new `FundamentalsCollector`) — 84 rows landed with
+`source='psx_terminal'`, each with title/date/category and (mostly) a
+`pdf_url` pointing at the real `dps.psx.com.pk/download/document/*.pdf`
+files. This partially fills the gap: `FilingSceptic` still has no *parsed
+filing text* (`raw_text` is empty, `pdf_parsed=false` — the PDF parser hasn't
+been pointed at these URLs yet, and wiring new data into agents is a
+deliberately separate decision), but the announcement *metadata* pipeline is
+no longer empty. The mirror serves only the latest ~10 announcements per
+ticker — it is a rolling window, not a historical archive, so PUCARS-direct
+scraping remains the eventual plan for depth.
+
 ### News-to-ticker matching is noisy
 
 Keyword matching (ticker symbol or first word of company name appearing in 
@@ -67,6 +79,64 @@ commercial API — no visible self-serve signup or free-tier key.
 **Decision:** not pursuing this right now. Revisit only if/when the project 
 moves toward having real paying subscribers, at which point a commercial data 
 contract makes more sense anyway.
+
+### PSX Terminal rides an undocumented internal endpoint (fragile by design)
+
+The Phase 5 Session 2 fundamentals/announcements integration
+(`backend/app/integrations/psx_terminal_client.py`) uses psxterminal.com,
+whose **documented REST API is mostly dead** (verified live, 2026-07-17):
+
+- `GET /api/symbols` and `GET /api/status` still work, no auth.
+- `GET /api/fundamentals/{S}`, `/api/companies/{S}`, `/api/dividends/{S}`,
+  `/api/ticks/{M}/{S}`, `/api/announcements/{S}` — the server **kills the
+  TCP connection without a response**. Confirmed not client-side: the same
+  requests fail identically via curl, httpx, *and* `fetch()` executed from
+  the site's own origin in a real browser. The site's own frontend never
+  calls them (it's SvelteKit SSR + WebSocket).
+- The project's GitHub repo (`mumtazkahn/psx-terminal`) now 404s — deleted
+  or private. The site footer now shows a commercial operator (Runtime
+  Technologies (SMC-PRIVATE) LIMITED), a sign-in, and a refund policy — the
+  open-API era of this service appears to be over.
+
+The integration therefore parses the **SvelteKit `__data.json` SSR
+payloads** the site itself is rendered from (`/financials/{S}/__data.json`
+for fundamentals, `/symbol/{S}/__data.json?market=REG` for announcements +
+dividends), with `?x-sveltekit-invalidated=01` to skip the ~350KB shared
+layout node. These are internal, undocumented endpoints in SvelteKit's
+"devalue" serialization — **any site redeploy can silently change the shape
+and break the collector**. The client is built to degrade (every parse
+failure returns None + a logged warning, never an exception), so a break
+will show up as a PARTIAL/failed `pipeline_runs` row and NULL-flagged
+verification output, not a crash. Re-run
+`backend/scripts/verify_psx_terminal.py` after any suspected breakage.
+
+### PSX Terminal per-ticker data gaps (observed live, 2026-07-17)
+
+Exact gaps found during the Phase 5 Session 2 verification run — none of
+these are smoothed over in the DB (missing = NULL, absent = no row):
+
+- **ENGRO: not listed at all.** PSX Terminal's symbol universe has only
+  ENGROH (post-merger Engro Holdings). ENGRO gets no fundamentals row and
+  no mirrored announcements from this source. See the ENGRO entry below —
+  this is a corporate-action problem, not a PSX Terminal defect.
+- **LUCK: `free_float_pct` NULL** — the source's
+  `float_shares_outstanding` field is missing for LUCK (confirmed at the
+  API, not a parse bug).
+- **LUCK and MARI: `dividend_yield` served as literal `0.0`.** Both
+  companies pay dividends, so treat a 0.0 yield from this source as
+  "probably no data" rather than a true zero. Stored as-is (0.0) because
+  that is what the source returned — flagging here instead of guessing.
+- **pdf_url coverage varies:** UBL 3/10, HBL 7/9, LUCK 9/10, OGDC 9/10
+  (the rest 10/10). Missing ones are mostly "Disclosure of Interest"
+  notices that carry only an image attachment, no PDF.
+- **Same-day same-title announcements collapse.** The dedup key is
+  ticker + title + date (per the session spec), so e.g. MEBL's six
+  separate "Disclosure of Interest…" filings on 2026-07-15 (different
+  executives, different posting times, identical titles) stored as one
+  row. Acceptable for our use (signal, not registry), but per-executive
+  granularity is lost. MEBL stored 5 rows from 10 fetched for this reason.
+- The mirror window is the latest ~10 announcements per ticker — a rolling
+  feed, not an archive (see the announcement-scraping entry above).
 
 ### Conviction scores currently cluster near 50-60 for most tickers
 
@@ -121,24 +191,32 @@ mistaken for a future regression — it's the expected output of the
 current formula with two of its four terms still structurally pinned
 to zero (filing always, ML almost always).
 
-### ENGRO has shorter price history than other tickers
+### ENGRO stopped trading in Jan 2025 (ENGRO → ENGROH corporate action)
 
 ENGRO has 887 raw `daily_prices` rows vs. ~1,238 for the other 9 tickers
 (confirmed via the Phase 3 Session 1 dataset build, 2026-06-27).
 
-**Root cause:** the mid-execution Antigravity session quota-out during the
-Phase 2A fix run (see Build Log, 2026-06-07/08 entry) — the recovery run
-never went back and backfilled ENGRO's missing date range.
+**Root cause — corrected 2026-07-17 (Phase 5 Session 2):** this entry
+previously blamed a mid-execution Antigravity quota-out during the Phase 2A
+fix run for an unfilled backfill gap. Direct SQL now shows ENGRO's series
+runs 2021-06-07 → **2025-01-03 and then stops** — it is not a gap, the
+ticker stopped trading. Engro Corporation was folded into Engro Holdings
+(**ENGROH**) around the turn of 2025, and PSX Terminal's symbol universe
+confirms it: ENGRO is absent, only ENGROH exists. Re-running the price
+collector cannot fix this — PSX DPS has nothing new to serve for a
+delisted symbol.
 
-**Current impact:** handled gracefully by Phase 3's per-ticker chronological
-split (ENGRO just gets proportionally fewer train/val/test rows), so it is
-not currently breaking anything. But it means ENGRO is trained/tested on a
-narrower history than every other ticker, which could make any
-ENGRO-specific model evaluation less reliable than for other tickers.
+**Current impact:** ENGRO's prices, ML rows, and any conviction report are
+frozen at January 2025; PSX Terminal fundamentals/announcements are
+unavailable for it (see the PSX Terminal gaps entry above). The ML
+dataset's ENGRO test window being disjoint from the other 9 tickers
+(flagged in the Phase 5 Session 1 backtest) is the same fact surfacing.
 
-**Suggested fix (not yet done):** re-run the price collector specifically
-for ENGRO against the PSX DPS endpoint to backfill the missing date range,
-then re-verify row count via direct SQL before rebuilding the ML dataset.
+**Decision needed (deferred, not this session):** either migrate the
+universe entry ENGRO → ENGROH (new seed row, fresh price history, decide
+what to do with the old ENGRO series), or drop ENGRO to a 9-ticker
+universe. Touching the ticker universe affects seeds, the ML dataset, and
+every stored report, so it deserves its own session.
 
 ---
 
