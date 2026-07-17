@@ -11,6 +11,8 @@ Usage from the backend/ directory:
     python scripts/run_pipeline.py --prices-only
     python scripts/run_pipeline.py --news-only
     python scripts/run_pipeline.py --fundamentals-only
+    python scripts/run_pipeline.py --dunya-only
+    python scripts/run_pipeline.py --flows-only
 """
 
 import argparse
@@ -30,6 +32,8 @@ async def main(
     prices_only: bool = False,
     news_only: bool = False,
     fundamentals_only: bool = False,
+    dunya_only: bool = False,
+    flows_only: bool = False,
 ) -> None:
     """
     Main async entry point for the pipeline runner.
@@ -75,6 +79,30 @@ async def main(
 
             result = await NewsCollector(db).run_safe(tickers)
             logger.info(f"News collection result: {result}")
+            return
+
+        # ── Institutional flows only (NCCPL FIPI/LIPI) ────────────────
+        if flows_only:
+            from app.collectors.institutional_flow_collector import (
+                InstitutionalFlowCollector,
+            )
+
+            result = await InstitutionalFlowCollector(db).run_safe(tickers)
+            logger.info(f"Institutional flow collection result: {result}")
+            return
+
+        # ── Dunya News only ───────────────────────────────────────────
+        if dunya_only:
+            from app.collectors.seed_data import seed_companies
+
+            await seed_companies(db)  # Ensure companies exist
+
+            from app.collectors.dunya_news_collector import (
+                DunyaNewsCollector,
+            )
+
+            result = await DunyaNewsCollector(db).run_safe(tickers)
+            logger.info(f"Dunya News collection result: {result}")
             return
 
         # ── Fundamentals only ─────────────────────────────────────────
@@ -145,6 +173,20 @@ Examples:
             "(seeds companies first)"
         ),
     )
+    parser.add_argument(
+        "--dunya-only",
+        action="store_true",
+        help="Only collect Dunya News articles (seeds companies first)",
+    )
+    parser.add_argument(
+        "--flows-only",
+        action="store_true",
+        help=(
+            "Only collect NCCPL FIPI/LIPI institutional flows via "
+            "Playwright (may be blocked by Cloudflare — see collector "
+            "docstring)"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -160,7 +202,16 @@ Examples:
 
     print(f"PSX Sentinel Pipeline Runner")
     print(f"Tickers: {', '.join(tickers)}")
-    print(f"Mode: {'seed-only' if args.seed_only else 'prices-only' if args.prices_only else 'news-only' if args.news_only else 'fundamentals-only' if args.fundamentals_only else 'full pipeline'}")
+    _mode = (
+        "seed-only" if args.seed_only
+        else "prices-only" if args.prices_only
+        else "news-only" if args.news_only
+        else "fundamentals-only" if args.fundamentals_only
+        else "dunya-only" if args.dunya_only
+        else "flows-only" if args.flows_only
+        else "full pipeline"
+    )
+    print(f"Mode: {_mode}")
     print()
 
     asyncio.run(
@@ -170,5 +221,7 @@ Examples:
             prices_only=args.prices_only,
             news_only=args.news_only,
             fundamentals_only=args.fundamentals_only,
+            dunya_only=args.dunya_only,
+            flows_only=args.flows_only,
         )
     )

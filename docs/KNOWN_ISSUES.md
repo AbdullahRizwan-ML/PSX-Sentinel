@@ -18,11 +18,18 @@ results — this is graceful, not a crash, but it means the `FilingSceptic`
 agent (Phase 2B) has no real filing text to analyze yet and is designed to 
 report low confidence and skip its LLM call rather than fabricate findings.
 
-**Planned fix (not yet built):** Playwright-based scraper targeting PUCARS 
+**Planned fix (not yet built):** direct scraping of PUCARS 
 (`pucars.psx.com.pk`), PSX's actual corporate-announcement disclosure system, 
-to pull quarterly result PDFs directly. This is higher-effort than the 
-current scrapers (needs a real headless browser, not just `httpx`) and was 
-deliberately deferred rather than rushed.
+to pull quarterly result PDFs directly.
+
+**Correction (Phase 5 Session 4, 2026-07-17):** earlier notes framed PUCARS 
+as a *Playwright/headless-browser* problem and implied a Playwright decision 
+would unlock it. That was wrong. PUCARS is a **login wall** — it requires 
+real PSX-issued credentials (listed-company / broker accounts), not merely a 
+JS-capable browser. Playwright does not solve a credential wall; adding it 
+(done this session for NCCPL) does **not** bring PUCARS any closer. PUCARS 
+stays blocked pending actual PSX credentials, which is an access/authorization 
+question, not a scraping-technology one.
 
 **Update (Phase 5 Session 2, 2026-07-17):** announcements are now *mirrored*
 from PSX Terminal (see the new `FundamentalsCollector`) — 84 rows landed with
@@ -49,15 +56,28 @@ genuinely about the specific company or just a tangential keyword hit, and to
 weight its sentiment analysis accordingly, reporting a `RELEVANT_ARTICLES` 
 count separately from the raw matched-article count.
 
+**Confirmed for Dunya too (Phase 5 Session 4):** `DunyaNewsCollector` uses the
+identical keyword rule and shows the same noise — e.g. generic "oil prices
+rise" headlines match OGDC/PPL via the "oil"/"petroleum" overlap, and
+"Pakistan discusses purchase of 16 Boeing aircraft" matched PPL+PSO off "PSO"
+appearing inside... actually via company-name first-word overlap. The
+NewsSynthesizer relevance-judgment mitigation covers Dunya rows the same way
+it covers ARY. No per-source fix attempted — it's the same known limitation.
+
 ### News source coverage is narrow
 
-Only ARY News RSS is confirmed working. See "Resolved" section below for the 
-full list of sources that were tried and failed.
+ARY News RSS and Dunya News (HTML scrape) are the two confirmed-working
+sources. See "Resolved" section below for the full list of sources that were
+tried and failed.
 
-**Possible future addition:** Dunya News's actual website (the business 
-section at `dunyanews.tv/en/Business`) loads without Cloudflare blocking, 
-unlike their RSS feed. Could be scraped directly (HTML, not RSS) as an 
-additional source. Not yet built — flagged as a nice-to-have, not blocking.
+**Dunya News — DONE (Phase 5 Session 4, 2026-07-17).** Re-verified live that
+`dunyanews.tv/en/Business` is plain static server-rendered HTML (HTTP 200 via
+httpx, no Cloudflare challenge, **no Playwright needed** — an earlier note
+lumping Dunya in with the Playwright decision was wrong and is corrected
+here). Built `DunyaNewsCollector` (static-HTML scrape of the Business listing
++ per-matched-article page fetch for summary/date), `source='dunya'`,
+pipeline Step 7/8, `--dunya-only` CLI flag. First live run: 29 rows across
+PPL/PSO/OGDC. Same keyword-matching noise as ARY applies (see below).
 
 ### Filing/fundamentals data is currently approximate
 
@@ -138,7 +158,7 @@ these are smoothed over in the DB (missing = NULL, absent = no row):
 - The mirror window is the latest ~10 announcements per ticker — a rolling
   feed, not an archive (see the announcement-scraping entry above).
 
-### NCCPL FIPI/LIPI — data channel found, collection blocked on the Playwright decision
+### NCCPL FIPI/LIPI — collector built (Playwright); automated challenge-pass fails on this host
 
 Probed live 2026-07-17 (Phase 5 Session 3). NCCPL (nccpl.com.pk)
 publishes daily Foreign/Local Investor Portfolio Investment data through
@@ -178,15 +198,45 @@ the challenge requires actual JavaScript execution. It was uninstalled
 again (not adopted). A real browser passes and everything works (that is
 how all of the above was verified).
 
-**Decision pending (Abdullah):** automated collection needs a headless
-browser — i.e. Playwright, which this project has deliberately avoided
-so far and which Railway would need installed at deploy time (browser
-binaries, ~hundreds of MB). Until that decision, the
-`institutional_flows` table (migration `1f70a79ddebc`, schema shaped by
-the verified live rows, NULLS-NOT-DISTINCT dedup constraint) sits empty
-and no collector exists. If Playwright is approved later, it would also
-unlock the deferred PUCARS scraper and Dunya News scraping — one
-decision, three data sources.
+**Update (Phase 5 Session 4, 2026-07-17) — Playwright adopted, collector
+built, but automation still can't pass the challenge on this host.**
+Playwright was installed (`playwright install chromium`) and
+`InstitutionalFlowCollector` was built to drive the mapped flow
+(challenge → CSRF → in-page day-by-day POSTs) into `institutional_flows`.
+But **automated Playwright cannot pass NCCPL's Cloudflare challenge on
+this machine**, tested thoroughly:
+
+- Playwright's bundled Chromium won't even launch here (`spawn UNKNOWN` —
+  a Windows side-by-side/runtime error on the headless-shell binary).
+- System Chrome (`channel="chrome"`) launches fine but the interactive
+  Cloudflare challenge never clears under automation — headless *and*
+  headed, with automation-fingerprint stealth flags
+  (`--disable-blink-features=AutomationControlled`,
+  `navigator.webdriver` spoof) and a Turnstile-checkbox click attempt.
+  All stayed on "Just a moment…" / "Attention Required".
+- The `cf_clearance` cookie is httpOnly and the genuine browser that does
+  pass (the Claude in-app browser pane, an Electron browser) can't hand it
+  to httpx, so cookie transplant isn't available either.
+
+So the collector is **correct and reusable but a no-op on an
+automation-flagged host** — it returns 0 rows + a logged error and writes
+a PARTIAL PipelineRun rather than crashing (verified end-to-end).
+
+**How the table actually got populated this session:** the real browser
+pane (which passes the challenge) was used to fetch the data via the
+site's own `fetch`, and a one-off bulk loader inserted it — **4,232 real
+rows**, 20 trading days (2026-06-17 → 2026-07-16), all 4 datasets, dedup
+proven (second load +0). See the Build Log. This is a manual bootstrap,
+NOT ongoing automation.
+
+**Still open for production:** unattended collection needs a clean/
+residential IP, a CAPTCHA-solving service, or a scheduled manual export —
+none solved here. **Railway deploy note:** even where the challenge is
+passable, the chromium binary must be installed at build time
+(`playwright install chromium`, ~hundreds of MB) — flagged in
+`requirements.txt`. (Correction to Session 3's note: Playwright does
+**not** unlock PUCARS — that's a login wall, see the announcement-scraping
+entry — and Dunya News never needed Playwright, it's static HTML.)
 
 ### Conviction scores currently cluster near 50-60 for most tickers
 
@@ -288,6 +338,17 @@ universe entry ENGRO → ENGROH (new seed row, fresh price history, decide
 what to do with the old ENGRO series), or drop ENGRO to a 9-ticker
 universe. Touching the ticker universe affects seeds, the ML dataset, and
 every stored report, so it deserves its own session.
+
+**Resolved for the universe (Phase 5 Session 4, 2026-07-17):** ENGROH was
+added as an 11th company (active in `PSX_TICKERS`; ENGRO removed from the
+active list). ENGROH backfilled cleanly via the existing collectors — 1,219
+price rows (2021-07-19 → 2026-07-16), fundamentals (P/E 4.99, mkt cap 320B,
+free float 18.04%; dividend_yield NULL at source), 10 mirrored announcements.
+**ENGRO stays as a frozen historical record:** its 887 price rows and
+`delisted_date=2025-01-14` are untouched, it is NOT in the active collection
+universe, and nothing backfills it further. Still deferred (own session): the
+ML dataset / backtest decision on whether to *train* on ENGROH — this session
+deliberately did not touch `ml_data/`.
 
 ---
 

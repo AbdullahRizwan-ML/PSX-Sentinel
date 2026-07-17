@@ -13,6 +13,10 @@ redis==5.2.0
 celery==5.4.0
 groq==0.13.0
 google-generativeai==0.8.3
+# playwright drives the NCCPL FIPI/LIPI collector (institutional_flow_collector.py).
+# DEPLOY NOTE: the pip package alone is not enough — the chromium browser
+# binary must be installed at build time via `playwright install chromium`
+# (Railway build step). See docs/KNOWN_ISSUES.md.
 playwright==1.49.0
 beautifulsoup4==4.12.3
 feedparser==6.0.11

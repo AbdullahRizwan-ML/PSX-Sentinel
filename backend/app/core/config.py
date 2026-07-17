@@ -44,7 +44,9 @@ class Settings(BaseSettings):
     NIGHTLY_PIPELINE_HOUR: int = 20  # 8 PM PKT — run daily data pipeline
 
     # ── PSX Tickers ────────────────────────────────────────────────────────────
-    PSX_TICKERS: str = "ENGRO,LUCK,OGDC,PPL,MCB,HBL,UBL,MARI,PSO,MEBL"
+    # Active collection universe. ENGRO (delisted 2025-01-14, frozen
+    # historical record) is deliberately absent; ENGROH is its successor.
+    PSX_TICKERS: str = "ENGROH,LUCK,OGDC,PPL,MCB,HBL,UBL,MARI,PSO,MEBL"
 
     # ── CORS / Frontend ───────────────────────────────────────────────────────
     FRONTEND_URL: str = "http://localhost:3000"

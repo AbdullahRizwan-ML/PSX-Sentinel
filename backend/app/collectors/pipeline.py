@@ -15,6 +15,10 @@ Execution sequence:
 5. Collect news (NewsCollector via RSS feeds)
 6. Collect fundamentals + announcement mirror (FundamentalsCollector
    via PSX Terminal)
+7. Collect Dunya News business articles (DunyaNewsCollector, static
+   HTML scrape)
+8. Collect NCCPL FIPI/LIPI institutional flows (InstitutionalFlow-
+   Collector via Playwright — see its docstring re: Cloudflare)
 
 Each stage runs independently — a failure in one stage does NOT
 prevent subsequent stages from executing. The pipeline always
@@ -25,7 +29,11 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.collectors.announcement_collector import AnnouncementCollector
+from app.collectors.dunya_news_collector import DunyaNewsCollector
 from app.collectors.fundamentals_collector import FundamentalsCollector
+from app.collectors.institutional_flow_collector import (
+    InstitutionalFlowCollector,
+)
 from app.collectors.news_collector import NewsCollector
 from app.collectors.pdf_parser import PDFParser
 from app.collectors.price_collector import PriceCollector
@@ -54,6 +62,8 @@ async def run_full_pipeline(
             "pdfs": {...},
             "news": {...},
             "fundamentals": {...},
+            "dunya_news": {...},
+            "institutional_flows": {...},
         }
     """
     settings = get_settings()
@@ -73,55 +83,75 @@ async def run_full_pipeline(
     try:
         seeded = await seed_companies(db)
         results["seed"] = {"records_inserted": seeded}
-        logger.info(f"Step 1/6 - Seed complete: {seeded} companies inserted")
+        logger.info(f"Step 1/8 - Seed complete: {seeded} companies inserted")
     except Exception as e:
-        logger.error(f"Step 1/6 - Seed failed: {type(e).__name__}: {e}")
+        logger.error(f"Step 1/8 - Seed failed: {type(e).__name__}: {e}")
         results["seed"] = {"error": str(e)}
 
     # ── Step 2: Collect prices ────────────────────────────────────────────
     try:
         price_result = await PriceCollector(db).run_safe(tickers)
         results["prices"] = price_result
-        logger.info(f"Step 2/6 - Prices complete: {price_result}")
+        logger.info(f"Step 2/8 - Prices complete: {price_result}")
     except Exception as e:
-        logger.error(f"Step 2/6 - Price collection failed: {e}")
+        logger.error(f"Step 2/8 - Price collection failed: {e}")
         results["prices"] = {"error": str(e)}
 
     # ── Step 3: Collect announcements ─────────────────────────────────────
     try:
         ann_result = await AnnouncementCollector(db).run_safe(tickers)
         results["announcements"] = ann_result
-        logger.info(f"Step 3/6 - Announcements complete: {ann_result}")
+        logger.info(f"Step 3/8 - Announcements complete: {ann_result}")
     except Exception as e:
-        logger.error(f"Step 3/6 - Announcement collection failed: {e}")
+        logger.error(f"Step 3/8 - Announcement collection failed: {e}")
         results["announcements"] = {"error": str(e)}
 
     # ── Step 4: Parse quarterly result PDFs ───────────────────────────────
     try:
         pdf_result = await PDFParser(db).run_safe(tickers)
         results["pdfs"] = pdf_result
-        logger.info(f"Step 4/6 - PDF parsing complete: {pdf_result}")
+        logger.info(f"Step 4/8 - PDF parsing complete: {pdf_result}")
     except Exception as e:
-        logger.error(f"Step 4/6 - PDF parsing failed: {e}")
+        logger.error(f"Step 4/8 - PDF parsing failed: {e}")
         results["pdfs"] = {"error": str(e)}
 
     # ── Step 5: Collect news ──────────────────────────────────────────────
     try:
         news_result = await NewsCollector(db).run_safe(tickers)
         results["news"] = news_result
-        logger.info(f"Step 5/6 - News complete: {news_result}")
+        logger.info(f"Step 5/8 - News complete: {news_result}")
     except Exception as e:
-        logger.error(f"Step 5/6 - News collection failed: {e}")
+        logger.error(f"Step 5/8 - News collection failed: {e}")
         results["news"] = {"error": str(e)}
 
     # ── Step 6: Collect fundamentals + PSX Terminal announcement mirror ──
     try:
         fundamentals_result = await FundamentalsCollector(db).run_safe(tickers)
         results["fundamentals"] = fundamentals_result
-        logger.info(f"Step 6/6 - Fundamentals complete: {fundamentals_result}")
+        logger.info(f"Step 6/8 - Fundamentals complete: {fundamentals_result}")
     except Exception as e:
-        logger.error(f"Step 6/6 - Fundamentals collection failed: {e}")
+        logger.error(f"Step 6/8 - Fundamentals collection failed: {e}")
         results["fundamentals"] = {"error": str(e)}
+
+    # ── Step 7: Collect Dunya News business articles ──────────────────────
+    try:
+        dunya_result = await DunyaNewsCollector(db).run_safe(tickers)
+        results["dunya_news"] = dunya_result
+        logger.info(f"Step 7/8 - Dunya News complete: {dunya_result}")
+    except Exception as e:
+        logger.error(f"Step 7/8 - Dunya News collection failed: {e}")
+        results["dunya_news"] = {"error": str(e)}
+
+    # ── Step 8: Collect NCCPL FIPI/LIPI institutional flows ───────────────
+    # Playwright-driven; a no-op (0 rows, logged) on any host where NCCPL's
+    # Cloudflare challenge blocks automation — never aborts the pipeline.
+    try:
+        flow_result = await InstitutionalFlowCollector(db).run_safe(tickers)
+        results["institutional_flows"] = flow_result
+        logger.info(f"Step 8/8 - Institutional flows complete: {flow_result}")
+    except Exception as e:
+        logger.error(f"Step 8/8 - Institutional flow collection failed: {e}")
+        results["institutional_flows"] = {"error": str(e)}
 
     logger.info("Full pipeline complete")
     logger.info(f"Pipeline results: {results}")

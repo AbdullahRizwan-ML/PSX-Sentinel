@@ -37,7 +37,23 @@ COMPANY_SEED_DATA = [
         # Delisted 2025-01-14 (Scheme of Arrangement — merged into Engro
         # Holdings, ENGROH). Last trading day 2025-01-13; PSX DPS serves
         # price data only through 2025-01-03. See docs/KNOWN_ISSUES.md.
+        # Kept as a frozen historical record — NOT in the active
+        # PSX_TICKERS collection universe (ENGROH is, since Session 4).
         "delisted_date": date(2025, 1, 14),
+    },
+    {
+        # Successor entity to ENGRO (Phase 5 Session 4): Dawood Hercules
+        # renamed Engro Holdings after absorbing Engro Corporation.
+        # PSX sector: "INV. BANKS / INV. COS. / SECURITIES COS.";
+        # KSE30 + KMI30 member and shariah-compliant per PSX Terminal
+        # listedIn (verified live 2026-07-17). Continuous DPS price
+        # history back to 2021-07-19 (the ex-Dawood-Hercules series).
+        "ticker": "ENGROH",
+        "name": "Engro Holdings Limited",
+        "sector": "Investment Companies",
+        "market_cap_pkr": 320_000_000_000.0,
+        "is_kse30": True,
+        "is_kmi30": True,
     },
     {
         "ticker": "LUCK",

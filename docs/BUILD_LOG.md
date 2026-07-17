@@ -2589,3 +2589,147 @@ requirements.txt untouched).
 **Protected files untouched:** `git diff --stat` shows only the files
 above. None of `trend_analyzer.py` / `news_synthesizer.py` /
 `filing_skeptic.py` / `orchestrator.py` / `arbitrator.py`.
+
+
+---
+
+## 2026-07-17 — Phase 5 Session 4: ENGROH universe + Dunya News + FIPI/LIPI (Playwright)
+
+Batched data-layer session, three sub-steps. Nothing wired into
+AgentContext, agent prompts, the ML feature set, or the conviction
+formula — data-layer only. None of the five protected files touched.
+
+### Sub-step 1 — ENGROH added to the active ticker universe (complete)
+
+Resolves the open question Session 3 left for Abdullah. ENGROH seeded as
+the 11th company (`Engro Holdings Limited`, sector "Investment
+Companies", KSE30+KMI30 + shariah per PSX Terminal `listedIn`, verified
+live). `PSX_TICKERS` swapped ENGRO→ENGROH in `config.py` + `.env` +
+`.env.example`; ENGRO removed from the *active* list but kept as a
+company row (frozen delisted-historical record, `delisted_date=2025-01-14`).
+
+Backfilled through the **existing** collectors — no collector code
+changed — and verified via direct SQL:
+
+| ENGROH data | result |
+|---|---|
+| `daily_prices` | 1,219 rows, 2021-07-19 → 2026-07-16 (price_collector, PSX DPS) |
+| `company_fundamentals` | P/E 4.99, mkt cap 319.66B, free float 18.04%, div yield NULL-at-source |
+| `announcements` | 10 rows, `source='psx_terminal'` |
+
+ENGRO untouched: still 887 rows ending 2025-01-03, still `delisted_date`
+set, NOT in `PSX_TICKERS`. **Deferred (own session):** whether to *train*
+the ML model on ENGROH — `ml_data/` deliberately not touched.
+
+### Sub-step 2 — Dunya News collector (complete)
+
+Re-verified live (per the Session-2 lesson) that
+`dunyanews.tv/en/Business` is **plain static server-rendered HTML** —
+HTTP 200 via httpx, no Cloudflare challenge, **no Playwright** (an
+earlier doc note lumping Dunya into the Playwright decision was wrong;
+corrected in KNOWN_ISSUES/CLAUDE.md). Built `DunyaNewsCollector`
+(`app/collectors/dunya_news_collector.py`): scrapes the Business listing
+(BeautifulSoup, article-URL regex), keyword-matches headlines to the
+active universe with the exact same rule as `NewsCollector`, then for
+*matched* articles only fetches the article page for the `<meta
+name="description">` summary and the `<time datetime>` publish date.
+`source='dunya'` keeps it distinct from ARY. Pipeline Step 7/8,
+`--dunya-only` CLI flag.
+
+**Live-verified:** first run inserted 29 rows across PPL(12)/PSO(11)/
+OGDC(6), 2026-07-15→17, all with summaries; `news_articles` now
+`arynews`=19 + `dunya`=29 = 48. Same keyword-match noise as ARY
+(oil-price headlines → OGDC/PPL etc.) — documented, mitigated by the
+existing NewsSynthesizer relevance judgment, no per-source fix.
+
+### Sub-step 3 — NCCPL FIPI/LIPI via Playwright (collector built; automated challenge-pass fails; table populated via browser-pane bootstrap)
+
+**Playwright adopted:** already pinned (`playwright==1.49.0`); ran
+`playwright install chromium`, added a deploy-note comment in
+`requirements.txt` (chromium binary must be installed at Railway build
+time). Built `InstitutionalFlowCollector`
+(`app/collectors/institutional_flow_collector.py`, Step 8/8,
+`--flows-only`) driving Session 3's mapped flow: load
+`/market-information` → wait out the Cloudflare challenge → read CSRF from
+the meta tag → in-page day-by-day POSTs to
+`/api/{fipi,lipi}-{normal,sector-wise}/data` → normalise (drop TOTAL
+rollups + `---` separators) → upsert to `institutional_flows` with
+`ON CONFLICT DO NOTHING`.
+
+**Automated challenge-pass does NOT work on this host — tested
+thoroughly, reported honestly:**
+
+- Playwright's bundled Chromium won't even launch here — `spawn UNKNOWN`
+  (a Windows side-by-side/runtime error on the headless-shell binary,
+  reproduced after `--force` reinstall).
+- System Chrome (`channel="chrome"`) launches, but the *interactive*
+  Cloudflare challenge never clears under automation: headless AND headed,
+  with `--disable-blink-features=AutomationControlled` +
+  `navigator.webdriver` spoof + a persistent profile + a Turnstile-
+  checkbox click. All stayed on "Just a moment…"/"Attention Required".
+- `cf_clearance` is httpOnly and the one browser that *does* pass (the
+  Claude in-app browser pane, an Electron browser) can't hand its cookie
+  to httpx — so cookie transplant is out too.
+
+The collector therefore degrades to **0 rows + a logged error + a PARTIAL
+PipelineRun** (verified end-to-end via `--flows-only`; it did not crash
+and did not touch existing rows). It stays in the tree as the correct,
+reusable artifact for a host where the challenge is passable.
+
+**Throughput test + backfill actually achieved:** the genuine browser
+pane passes the challenge, so it was used as the data channel (its
+same-origin `fetch` auto-uses the httpOnly clearance cookie). Measured
+~0.7s/request. A full backfill to 2015-12-09 (~2,600 trading days × 4
+datasets ≈ 10k requests ≈ 2h) is mechanically possible but hinges on a
+hand-cleared session and isn't a production story — so a **sensible
+initial backfill of the last 30 calendar days (20 trading days)** was
+taken. Fetched all 4 datasets through the pane (results auto-saved to
+tool-result files to avoid context bloat) and bulk-loaded via a
+`execute_values` loader.
+
+**Live-verified (`scripts/verify_institutional_flows.py`, direct SQL —
+0 failures):**
+
+| dataset | rows | days | client types |
+|---|---:|---:|---|
+| fipi_normal | 125 | 20 | FOREIGN CORPORATES / INDIVIDUAL / OVERSEAS PAKISTANI |
+| lipi_normal | 490 | 20 | INDIVIDUALS, COMPANIES, BANKS/DFI, MUTUAL FUNDS, INSURANCE, NBFC, BROKER PROP, OTHER ORG |
+| fipi_sector_wise | 728 | 20 | (FIPI categories) |
+| lipi_sector_wise | 2,889 | 20 | (LIPI categories) |
+| **total** | **4,232** | 2026-06-17 → 2026-07-16 | 11 sectors incl. all our tickers' |
+
+Dedup proven: re-running the loader inserted +0 (all 4,232 skipped via
+`uq_flow_row`). No TOTAL rollups, no `---` separators, market-wide rows
+have NULL sector_code, no NULL net_value. Net-flow spot check sane
+(foreign corporates net +2.64B PKR on 2026-07-16). **This is a manual
+bootstrap, not automation** — clearly labelled everywhere.
+
+**Still open for production (KNOWN_ISSUES):** unattended NCCPL collection
+needs a clean/residential IP, a CAPTCHA-solving service, or a scheduled
+manual export. Railway needs the chromium binary at build time.
+
+### Doc corrections carried in from Session 3 (as instructed)
+
+- **PUCARS is a login wall, not a Playwright problem** — needs real
+  PSX-issued credentials; adding Playwright does not bring it closer.
+  Fixed in KNOWN_ISSUES (announcement-scraping entry) and CLAUDE.md
+  (data-source table + deferred list).
+- **Dunya News needed no Playwright** — static HTML. Fixed in both files;
+  the "one decision, three sources" framing from Session 3 is retracted.
+
+### Files touched
+
+New: `backend/app/collectors/dunya_news_collector.py`,
+`backend/app/collectors/institutional_flow_collector.py`,
+`backend/scripts/verify_institutional_flows.py`.
+Modified: `backend/app/collectors/seed_data.py` (ENGROH),
+`backend/app/core/config.py` (PSX_TICKERS), `backend/.env.example`,
+`backend/app/collectors/pipeline.py` (steps 7 + 8, renumbered to /8),
+`backend/scripts/run_pipeline.py` (`--dunya-only`, `--flows-only`),
+`backend/requirements.txt` (playwright deploy note),
+`CLAUDE.md`, `docs/KNOWN_ISSUES.md`, this file. (`.env` also changed
+locally — gitignored, not committed.)
+
+**Protected files untouched:** `git diff --stat` shows none of
+`trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
+`orchestrator.py` / `arbitrator.py`.
