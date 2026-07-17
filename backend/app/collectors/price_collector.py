@@ -12,6 +12,17 @@ NOTE: The DPS API does not provide High/Low values separately.
       This is acceptable for trend analysis and ML features. Intraday
       highs/lows would require tick-level data from a paid PSX feed.
 
+DEPTH LIMIT (verified live, Phase 5 Session 5, 2026-07-17): the EOD
+      endpoint serves a fixed rolling ~5-year window and IGNORES all
+      date parameters — from/to, start/end, period, and unix-timestamp
+      forms were each tested and all return the identical window
+      (2021-07-19 -> today as of the test date). Deeper history does
+      not exist at this source. The from/to params below are still sent
+      in case DPS ever starts honoring them, but the effective request
+      is always "everything the source offers", and rows already in the
+      DB that have rolled off the source window are never lost (insert
+      is per-row dedup'd, nothing is deleted).
+
 PREVIOUS SOURCE (removed): yfinance with .KA suffix — permanently
       broken due to Cloudflare blocking by Yahoo Finance.
 """
@@ -31,7 +42,7 @@ from app.db.models import DailyPrice
 
 class PriceCollector(BaseCollector):
     """
-    Downloads up to 2 years of daily EOD data per ticker from PSX DPS.
+    Downloads the full available daily EOD history per ticker from PSX DPS.
 
     The PSX Data Portal Service is the official data source operated
     by the Pakistan Stock Exchange. Data is inserted with a per-row
@@ -43,7 +54,11 @@ class PriceCollector(BaseCollector):
 
     DPS_BASE_URL = "https://dps.psx.com.pk/timeseries/eod"
     SLEEP_BETWEEN_TICKERS = 1.0  # PSX DPS is generous with rate limits
-    HISTORY_DAYS = 730  # 2 years of daily data
+    # Request 6 years; DPS ignores this and serves its rolling ~5-year
+    # window regardless (see module docstring) — kept wider than the
+    # real window so nothing is left unrequested if the param ever
+    # starts being honored.
+    HISTORY_DAYS = 2190
 
     HEADERS = {
         "User-Agent": (
@@ -57,8 +72,9 @@ class PriceCollector(BaseCollector):
 
     async def collect(self, tickers: list[str]) -> dict:
         """
-        Fetch up to 2 years of daily EOD data for each ticker
-        from the PSX DPS timeseries API.
+        Fetch the full available daily EOD history for each ticker
+        from the PSX DPS timeseries API (a rolling ~5-year window —
+        the source ignores requested date ranges, see module docstring).
 
         For each ticker:
         1. GET https://dps.psx.com.pk/timeseries/eod/{ticker}

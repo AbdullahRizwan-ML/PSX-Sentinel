@@ -2733,3 +2733,158 @@ locally — gitignored, not committed.)
 **Protected files untouched:** `git diff --stat` shows none of
 `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
 `orchestrator.py` / `arbitrator.py`.
+
+
+---
+
+## 2026-07-17 — Phase 5 Session 5: historical depth extension (price + FIPI/LIPI, matched window)
+
+Pure data-depth session ahead of the next session's ML retrain. Deepened
+the two training-relevant time series (prices + institutional flows) to a
+single matched window. Nothing wired into AgentContext, agent prompts,
+the ML feature set, or the conviction formula. None of the five protected
+files touched.
+
+### Part 1 — real achievable depth (measured, not assumed)
+
+Probed PSX DPS directly (not just our DB) for the earliest date the
+*source* offers, all 11 tickers:
+
+- **Every ticker's series starts 2021-07-19 at the source today**, and
+  the endpoint serves a **fixed rolling ~5-year window that IGNORES all
+  date parameters.** Tested `from=1990-01-01`, a fixed past window
+  (`from=2015-01-01&to=2016-01-01` — still returned 2021-2026), `start`/
+  `end`, `period=10y`, and unix-timestamp `from` — all returned the
+  identical 1,237-row 2021-07-19→2026-07-17 window. `timeseries/int` is
+  current-day intraday ticks only, not an archive.
+- **So 7-8 years is NOT achievable from this source — reported plainly.**
+  Our DB already holds *more* than the source now serves on the left edge
+  (2021-06-07/08, captured June 2026 before those rows rolled off), so
+  `daily_prices` is now the archive, not a cache.
+- **Matched target window locked at 2021-06-07 → 2026-07-17 (~5.1 yr),
+  bounded by price depth.** FIPI/LIPI matched to it (NCCPL's archive
+  reaches 2015-12-09, but pre-2021-06 flows would have no price data to
+  pair for ML).
+- **PSX Terminal fundamentals check:** what we *store* is a **current
+  snapshot only** (one row/ticker, no history) — flagged as a
+  **lookahead-bias risk** for next session's feature design (today's P/E
+  must not be a feature on a 2023 row). But the raw `/financials`
+  payload's `fyReports` carries **20 fiscal years (FY2006–FY2025) of
+  reported annual statements** incl. per-FY `price_earnings`,
+  `dividends_yield`, `market_cap_basic`, and `earnings_release_date` — so
+  a properly point-in-time *annual* fundamentals feature is feasible
+  later. Not built (out of scope); no fake historical fundamentals
+  fabricated. Both findings recorded in KNOWN_ISSUES.
+
+### Part 2 — price backfill (complete)
+
+Widened `price_collector.HISTORY_DAYS` 730 → 2190 and documented the
+rolling-window reality in its docstring (the `from`/`to` params are now
+decorative until DPS honors them). Ran `--prices-only`; per-row dedup
+means it only topped up the right edge. **253 rows inserted, 10/10 active
+tickers SUCCESS, ~55 min** (Neon round-trip bound). Verified via direct
+SQL:
+
+- All 10 active tickers now end **2026-07-17** (were stale at 2026-06-05,
+  except ENGROH/LUCK/OGDC/PPL which the run happened to reach first).
+  Per-ticker: MCB/HBL/UBL/MARI/PSO/MEBL/OGDC/PPL 1,266 rows each, LUCK
+  1,262, ENGROH 1,220.
+- **ENGRO boundary respected:** still 887 rows, ends 2025-01-03,
+  `delisted_date=2025-01-14`, NOT in the active list, not extended.
+- `daily_prices` total **13,497 rows**.
+
+### Part 3 — FIPI/LIPI historical backfill (complete, matched window)
+
+Reused Session 4's proven channel (Claude Browser pane passes NCCPL's
+Cloudflare challenge; automated Playwright still can't — Problem B, left
+untouched). Built a **month-chunked, resumable, disk-buffered** pipeline
+addressing Session 4's context-bloat and slow-load pain points:
+
+- an in-page JS loop fetches one month at a time (4 datasets × each
+  trading day, ~1.3 req/s) and POSTs the month's payload to a **localhost
+  receiver** (`chunk_receiver.py`, port 8765, CORS for the NCCPL origin +
+  the Private-Network preflight header) that writes each chunk straight
+  to disk — big payloads never route through model context;
+- a **`execute_values` bulk loader** (`load_flow_chunks.py`, same
+  normalisation as `InstitutionalFlowCollector._normalise`) loads chunks
+  in batches — NOT the row-by-row approach Session 4 found too slow;
+- **resumability**: the loop reads a `/todo` (weekdays in-window minus
+  dates already in the DB minus months already on disk) and skips
+  saved months, so a mid-run session death costs only the in-flight
+  month. This mattered: **the NCCPL Cloudflare session died twice**
+  (~45-min lifetime; once mid-`2023-08`, once at `2026-01`). A
+  consecutive-403 breaker halted the loop cleanly WITHOUT saving the
+  partial month each time; recovery was re-navigate (re-pass the
+  challenge, fresh CSRF) + re-kick, resuming exactly where it stopped.
+  The one partially-fetched `2023-08` chunk was discarded and refetched
+  clean (its 58 pre-death rows deduped on reload).
+
+**Result (direct SQL): `institutional_flows` 4,232 → 268,142 rows**
+(+263,910 this session), **1,267 trading days, 2021-06-07 → 2026-07-17,
+all 4 datasets full-span:**
+
+| dataset | rows | days |
+|---|---:|---:|
+| fipi_normal | 8,066 | 1,267 |
+| lipi_normal | 30,868 | 1,267 |
+| fipi_sector_wise | 46,584 | 1,267 |
+| lipi_sector_wise | 182,624 | 1,267 |
+
+Neon DB size 13 MB → **99 MB** (well within the 512 MB free tier).
+**Dedup re-proven**: a full reload of every chunk inserted **+0 rows**.
+
+### Verification (`scripts/verify_depth_extension.py`, read-only direct SQL)
+
+New verifier, **0 failed**. Passing checks: all 10 active tickers share
+one right edge (2026-07-17); ENGRO frozen (887 rows / 2025-01-03); no
+suspiciously long contiguous price gap (longest per-ticker run ≤ 10
+days); all 4 flow datasets reach 2021-06-07; every PSX trading day (MCB
+reference) has flow data; every flow date carries all 4 datasets; no
+TOTAL / `---` / blank-client-type rows; no duplicate dedup keys.
+
+**Honest data-shape finding (surfaced by the verifier, resolved not
+smoothed over):** the first draft of the verifier hard-asserted "every
+active ticker traded every day ≥9 others did" and FAILED with 22 holes
+— 17 ENGROH + 5 LUCK. Investigated by probing **PSX DPS live** for the
+exact ticker/date combos: **all 22 are absent from the source itself**,
+so they are genuine no-trade days, not collection gaps. ENGROH (ex-Dawood
+Hercules, an illiquid holding company) has 17 scattered single no-print
+days; LUCK's 5 are a contiguous 2025-04-21…25 run — a trading suspension
+around its 2025-04-28 5:1 split. Our per-ticker row counts byte-match
+what DPS serves. The uniformity assumption was wrong (thinly-traded names
+legitimately skip days the blue chips don't), so the check was corrected
+to report holes as informational and hard-fail only on a long contiguous
+run (the actual collection-failure signature). This is the project's
+"verify against reality, don't trust a convenient assumption" rule doing
+its job.
+
+### Depth actually achieved (honest)
+
+**~5.1 years (2021-06-07 → 2026-07-17), NOT 7-8 years.** PSX DPS's rolling
+~5-year window is the hard ceiling for price data, and the FIPI/LIPI
+window was matched to it deliberately. NCCPL alone could go to 2015-12-09,
+but that extra history would have no price partner for ML training.
+
+### Problem B (ongoing automated FIPI/LIPI collection) — still UNSOLVED
+
+Reaffirmed in KNOWN_ISSUES. This session deepened the *historical archive*
+by hand (browser-pane bootstrap); it did **not** make daily collection
+run unattended. `InstitutionalFlowCollector` (Playwright) is still
+Cloudflare-blocked on this host — no attempt to fix it here (out of
+scope). Production still needs a clean IP / CAPTCHA solver / manual
+export.
+
+### Files touched
+
+New: `backend/scripts/verify_depth_extension.py`.
+Modified: `backend/app/collectors/price_collector.py` (HISTORY_DAYS +
+depth-cap docstring), `.gitignore` (`backend/data/nccpl_backfill/`),
+`CLAUDE.md`, `docs/KNOWN_ISSUES.md`, this file. The backfill fetch/load
+scripts (`chunk_receiver.py`, `load_flow_chunks.py`, the pane loop) are
+one-off local tooling in the scratchpad, not committed — the DB is the
+deliverable. Raw NCCPL chunks under `backend/data/nccpl_backfill/` are
+gitignored (loaded into Postgres; DB is the source of truth).
+
+**Protected files untouched:** `git diff --stat` shows none of
+`trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
+`orchestrator.py` / `arbitrator.py`.

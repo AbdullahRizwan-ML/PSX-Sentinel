@@ -79,6 +79,63 @@ here). Built `DunyaNewsCollector` (static-HTML scrape of the Business listing
 pipeline Step 7/8, `--dunya-only` CLI flag. First live run: 29 rows across
 PPL/PSO/OGDC. Same keyword-matching noise as ARY applies (see below).
 
+### PSX DPS price depth caps at a rolling ~5-year window (date params ignored)
+
+Verified live 2026-07-17 (Phase 5 Session 5, while determining the real
+achievable backfill depth): the EOD timeseries endpoint
+(`dps.psx.com.pk/timeseries/eod/{ticker}`) serves a **fixed rolling
+~5-year window and ignores every date parameter**. Tested and all
+returned the identical window (2021-07-19 → today at test time):
+
+- `from=1990-01-01` (far-past start)
+- `from=2015-01-01&to=2016-01-01` (a fixed window entirely in the past —
+  still returned 2021-2026 data)
+- `start`/`end` alternates, `period=10y`, unix-timestamp `from`
+- the `timeseries/int/{ticker}` flavor is intraday ticks for the current
+  day only, not an archive
+
+**Consequences:**
+
+- **7-8 years of price history is not obtainable from this source.** The
+  deepest price series this project can hold is what it already captured:
+  2021-06-07 onward (rows collected in June 2026, before they rolled off
+  the source's window — DPS itself now starts at 2021-07-19).
+- **`daily_prices` is now the archive, not a cache.** Rows older than the
+  source's rolling window cannot be re-fetched if lost. Treat the table
+  (and Neon backups) accordingly; never truncate-and-reload it.
+- The collector's `from`/`to` request params are decorative until DPS
+  honors them (kept in case that ever changes — see the depth-limit note
+  in `price_collector.py`).
+- This capped the Session 5 "matched window" for FIPI/LIPI at
+  2021-06-07 → present: NCCPL's archive goes to 2015-12-09, but flows
+  before the price series' left edge would have no price data to pair
+  with for ML training.
+
+### PSX Terminal fundamentals are a current snapshot — lookahead-bias risk for ML features
+
+Flagged 2026-07-17 (Phase 5 Session 5, Part 1). The
+`company_fundamentals` table holds **one current-snapshot row per
+ticker** (today's P/E, dividend yield, market cap, free float). It has
+no history and no as-of dates beyond `scraped_at`.
+
+**Do not join these values onto historical training rows.** Using
+today's P/E as a feature for a 2023 training row is lookahead bias —
+the number embeds price/earnings information from after the row's date.
+Whoever designs the next ML feature set must either leave fundamentals
+out or build a properly dated history first.
+
+**A legitimate path exists if wanted later:** PSX Terminal's
+`/financials/{S}/__data.json` payload carries a `fyReports` list with
+**20 fiscal years (FY2006–FY2025) of reported annual statements**
+(revenue, EPS, net income, ~250+ fields each) **including per-FY
+`price_earnings`, `dividends_yield`, `market_cap_basic`, and — key for
+point-in-time correctness — `earnings_release_date`**, so a feature can
+be built that only uses a fiscal year's numbers from the date they were
+actually published. Not built in Session 5 (deliberately — this session
+was depth extension, not feature design); it inherits the same
+fragile-undocumented-endpoint caveat as the rest of the PSX Terminal
+integration. No fake historical fundamentals were fabricated.
+
 ### Filing/fundamentals data is currently approximate
 
 The PSX DPS timeseries endpoint does not provide intraday high/low — only 
@@ -229,14 +286,32 @@ rows**, 20 trading days (2026-06-17 → 2026-07-16), all 4 datasets, dedup
 proven (second load +0). See the Build Log. This is a manual bootstrap,
 NOT ongoing automation.
 
-**Still open for production:** unattended collection needs a clean/
-residential IP, a CAPTCHA-solving service, or a scheduled manual export —
-none solved here. **Railway deploy note:** even where the challenge is
-passable, the chromium binary must be installed at build time
-(`playwright install chromium`, ~hundreds of MB) — flagged in
-`requirements.txt`. (Correction to Session 3's note: Playwright does
-**not** unlock PUCARS — that's a login wall, see the announcement-scraping
-entry — and Dunya News never needed Playwright, it's static HTML.)
+**Historical backfill extended (Phase 5 Session 5, 2026-07-17):** the
+same browser-pane channel was used to backfill the **full matched
+window** — 2021-06-07 → 2026-07-17, **1,267 trading days, all 4
+datasets, 268,142 rows** (up from the 4,232-row/20-day Session 4
+bootstrap). Done via a month-chunked, resumable, disk-buffered loop
+(pane `fetch` → localhost receiver → `execute_values` bulk loader) so a
+mid-run Cloudflare-session death only costs the in-flight month, not a
+restart — which happened twice and recovered cleanly (re-navigate to
+re-pass the challenge, resume only the months not yet on disk/in the DB).
+Dedup re-proven (full reload of every chunk inserted +0). This is still
+a **manual bootstrap, not automation.**
+
+**⚠️ Problem B — ongoing UNATTENDED collection — remains UNSOLVED and is
+separate from the Session 5 backfill above.** Session 5 deepened the
+*historical* archive by hand; it did **not** make daily collection run
+by itself. `InstitutionalFlowCollector` (automated Playwright) is still
+Cloudflare-blocked on this host (0 rows + logged error), exactly as in
+Session 4 — no attempt was made to fix it this session (out of scope).
+Unattended collection still needs a clean/residential IP, a
+CAPTCHA-solving service, or a scheduled manual export — none solved
+here. **Railway deploy note:** even where the challenge is passable, the
+chromium binary must be installed at build time (`playwright install
+chromium`, ~hundreds of MB) — flagged in `requirements.txt`.
+(Correction to Session 3's note: Playwright does **not** unlock
+PUCARS — that's a login wall, see the announcement-scraping entry — and
+Dunya News never needed Playwright, it's static HTML.)
 
 ### Conviction scores currently cluster near 50-60 for most tickers
 

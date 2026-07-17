@@ -19,6 +19,10 @@ backend/logs/
 # ML training artifacts (generated locally by scripts/build_ml_dataset.py)
 backend/ml_data/
 
+# Raw NCCPL FIPI/LIPI backfill chunks (local fetch artifacts, loaded into
+# Postgres by the bulk loader — the DB is the source of truth, not these)
+backend/data/nccpl_backfill/
+
 # OS
 .DS_Store
 Thumbs.db
