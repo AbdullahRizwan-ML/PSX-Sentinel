@@ -108,6 +108,9 @@ class Company(Base):
         BigInteger, nullable=True
     )
     listing_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    delisted_date: Mapped[Optional[date]] = mapped_column(
+        Date, nullable=True
+    )  # PSX formal delisting effective date; NULL = still listed
     is_kse30: Mapped[bool] = mapped_column(Boolean, default=False)
     is_kmi30: Mapped[bool] = mapped_column(Boolean, default=False)
     last_updated: Mapped[datetime] = mapped_column(
@@ -232,6 +235,87 @@ class CompanyFundamentals(Base):
         return (
             f"<CompanyFundamentals {self.ticker} pe={self.pe_ratio} "
             f"yield={self.dividend_yield}>"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3c. InstitutionalFlow (FIPI/LIPI)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class InstitutionalFlow(Base):
+    """
+    One day's FIPI/LIPI portfolio-investment row from NCCPL
+    (nccpl.com.pk): buy/sell/net turnover for one investor category, in
+    one market type, optionally within one sector. NOT per-ticker — the
+    finest granularity NCCPL publishes is sector level (verified live,
+    2026-07-17).
+
+    dataset values: fipi_normal, lipi_normal (market-wide; sector_code
+    NULL) and fipi_sector_wise, lipi_sector_wise (sector rows).
+    client_type examples: FOREIGN CORPORATES, OVERSEAS PAKISTANI,
+    FOREIGN INDIVIDUAL (FIPI); INDIVIDUALS, COMPANIES, BANKS/DFI,
+    MUTUAL FUNDS, ... (LIPI). market_type: REG, FUT, BNB, GEM, NDM, ODL
+    (older archive rows spell it REGULAR/FUTURE...). Values are PKR;
+    sell/net columns can be negative (sells are served negative at the
+    source and stored as-is). usd_value is NCCPL's own USD conversion
+    of net_value. Source TOTAL rollup rows are derived data and are NOT
+    stored.
+
+    NOTE (2026-07-17): no collector exists yet — NCCPL sits behind a
+    Cloudflare JS challenge, so automated collection needs a headless
+    browser (Playwright), which is a pending project decision. The
+    table ships ahead of that decision because the row shape was
+    verified against live API responses. See docs/KNOWN_ISSUES.md.
+    """
+    __tablename__ = "institutional_flows"
+    __table_args__ = (
+        UniqueConstraint(
+            "date", "dataset", "client_type", "sector_code", "market_type",
+            name="uq_flow_row",
+            # sector_code is NULL for the market-wide datasets; without
+            # this, Postgres would treat those rows as always-distinct
+            # and the dedup constraint would be a no-op for them.
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    dataset: Mapped[str] = mapped_column(String(30), nullable=False)
+    client_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    sector_code: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True
+    )  # NCCPL S-codes, e.g. S0005; NULL for market-wide rows
+    sector_name: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True
+    )
+    market_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    buy_volume: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    buy_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sell_volume: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    sell_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    net_volume: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    net_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    usd_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="nccpl"
+    )
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<InstitutionalFlow {self.date} {self.dataset} "
+            f"{self.client_type} {self.market_type} net={self.net_value}>"
         )
 
 

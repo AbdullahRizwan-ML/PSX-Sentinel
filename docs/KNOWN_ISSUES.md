@@ -138,6 +138,56 @@ these are smoothed over in the DB (missing = NULL, absent = no row):
 - The mirror window is the latest ~10 announcements per ticker — a rolling
   feed, not an archive (see the announcement-scraping entry above).
 
+### NCCPL FIPI/LIPI — data channel found, collection blocked on the Playwright decision
+
+Probed live 2026-07-17 (Phase 5 Session 3). NCCPL (nccpl.com.pk)
+publishes daily Foreign/Local Investor Portfolio Investment data through
+an internal JSON API that its own site calls:
+
+- `GET /api/{fipi,lipi}-{normal,sector-wise}/latest-date` → freshness
+  (returned 2026-07-16 — data is current).
+- `POST /api/{fipi,lipi}-normal/data` with body `{"date": "YYYY-MM-DD"}`
+  and `POST /api/{fipi,lipi}-sector-wise/data` with
+  `{"fromDate": ..., "toDate": ...}` — both need an `X-CSRF-TOKEN`
+  header scraped from any page's `<meta name="csrf-token">` (Laravel)
+  plus the session cookie.
+- Row shape (verified on real responses): `CLIENT_TYPE`, `MARKET_TYPE`
+  (REG/FUT/BNB/GEM/NDM/ODL + derived TOTAL rows), `BUY/SELL/NET_VOLUME`,
+  `BUY/SELL/NET_VALUE` (PKR; sells served negative), `USD`; sector-wise
+  adds `SEC_CODE`/`SECTOR_NAME`.
+- **Granularity: sector level at best — there is NO per-ticker
+  breakdown.** Sector-wise covers ~10 named sectors (Cement, Fertilizer,
+  both O&G sectors, Commercial Banks, Power, Tech, Textile, Food, Debt
+  Market) plus an "All other Sectors" catch-all — the named ones cover
+  all 10 of our tickers' sectors.
+- **Archive depth: full history back to 2015-12-09** through the same
+  API. Label drift across the archive: 2015-era rows say
+  `FOREIGN INDIVIDUAL` / `REGULAR`, modern rows say
+  `FOREIGN CORPORATES ` (trailing space) / `REG`. LIPI's TOTAL rows have
+  a *blank* CLIENT_TYPE; FIPI wraps rows in `records` while LIPI uses
+  `data`. Non-trading days return 200 + empty list.
+- **Ranged sector queries return per-day rows concatenated WITHOUT a
+  date column** (6-week range → 1,267 undated rows), so a collector must
+  fetch day-by-day, one POST per date per dataset.
+
+**The blocker:** the entire www.nccpl.com.pk zone (API paths included)
+sits behind a Cloudflare *JS challenge* ("Just a moment…"). Plain httpx
+and curl get 403 challenge pages; `curl_cffi` browser-TLS impersonation
+(chrome131 / firefox135 / safari184) was tested and **also fails** —
+the challenge requires actual JavaScript execution. It was uninstalled
+again (not adopted). A real browser passes and everything works (that is
+how all of the above was verified).
+
+**Decision pending (Abdullah):** automated collection needs a headless
+browser — i.e. Playwright, which this project has deliberately avoided
+so far and which Railway would need installed at deploy time (browser
+binaries, ~hundreds of MB). Until that decision, the
+`institutional_flows` table (migration `1f70a79ddebc`, schema shaped by
+the verified live rows, NULLS-NOT-DISTINCT dedup constraint) sits empty
+and no collector exists. If Playwright is approved later, it would also
+unlock the deferred PUCARS scraper and Dunya News scraping — one
+decision, three data sources.
+
 ### Conviction scores currently cluster near 50-60 for most tickers
 
 Live verification of Phase 2B Session 2's `AnalysisOrchestrator` (see Build
@@ -205,6 +255,27 @@ ticker stopped trading. Engro Corporation was folded into Engro Holdings
 confirms it: ENGRO is absent, only ENGROH exists. Re-running the price
 collector cannot fix this — PSX DPS has nothing new to serve for a
 delisted symbol.
+
+**Confirmed with primary evidence — Phase 5 Session 3 (2026-07-17):**
+
+- PSX formally delisted ENGRO effective **2025-01-14**; the last trading
+  day was **2025-01-13**. Mechanism: a Scheme of Arrangement under which
+  Engro Corporation merged into Dawood Hercules Corporation, which was
+  renamed **Engro Holdings Limited (ENGROH)**; ENGRO shareholders were
+  swapped into ENGROH and Engro Corp became its wholly-owned subsidiary.
+  (Reported by Profit/Pakistan Today and Mettis Global, 2025-01-14.)
+- PSX DPS, queried live, still serves the old ENGRO series but it ends at
+  **2025-01-03** — exactly matching our `daily_prices` (887 rows,
+  2021-06-07 → 2025-01-03). So our collection was never at fault, and the
+  final ~6 trading days (Jan 6–13, 2025) are simply absent from DPS's EOD
+  series — unrecoverable from this source.
+- **ENGROH exists on PSX DPS with live data**: probed 2026-07-17, 1,219
+  rows spanning 2021-07-19 → 2026-07-16 (the continuous ex-Dawood-Hercules
+  series, renamed in place).
+- The fact is now first-class in the schema: `companies.delisted_date`
+  (nullable Date, migration `44cd906f6e1e`) is set to 2025-01-14 for
+  ENGRO and NULL for the other nine. The ENGRO seed entry carries the
+  same date for fresh databases.
 
 **Current impact:** ENGRO's prices, ML rows, and any conviction report are
 frozen at January 2025; PSX Terminal fundamentals/announcements are

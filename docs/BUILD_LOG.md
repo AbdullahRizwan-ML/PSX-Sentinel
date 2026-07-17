@@ -2459,3 +2459,133 @@ Modified: `backend/app/db/models.py`, `backend/app/collectors/pipeline.py`
 `run_pipeline.py` modified + the new files above. None of
 `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
 `orchestrator.py` / `arbitrator.py` appear in the diff.
+
+
+---
+
+## 2026-07-17 — Phase 5 Session 3: ENGRO/ENGROH resolution + FIPI/LIPI groundwork
+
+Batched data-layer session, two independent sub-steps (same pattern as
+Phase 4 Session 6). Nothing wired into AgentContext, agent prompts, the
+ML feature set, or the conviction formula — both sub-steps end as
+verified data-layer state only. None of the five protected files touched.
+
+### Sub-step 1 — ENGRO/ENGROH resolution (complete)
+
+**Re-confirmed with primary evidence, not by trusting Session 2's note:**
+
+- Direct SQL: ENGRO's `daily_prices` run 2021-06-07 → **2025-01-03**,
+  887 rows; every other ticker's series runs to 2026-06-05.
+- PSX DPS queried live for ENGRO *today*: still serves the symbol, but
+  its series also ends **2025-01-03** — identical to our data. So the
+  old "Phase 2A backfill gap" theory is conclusively dead: our collector
+  captured everything the source has. The final trading days (Jan 6–13,
+  2025) are absent from DPS's EOD series itself — unrecoverable from
+  this source.
+- PSX DPS queried live for **ENGROH**: exists with real, current data —
+  1,219 rows spanning 2021-07-19 → 2026-07-16 (the continuous
+  ex-Dawood-Hercules series renamed in place).
+- Web check (Profit/Pakistan Today, Mettis Global, both 2025-01-14):
+  PSX formally **delisted ENGRO effective 2025-01-14**; last trading day
+  2025-01-13; mechanism was a Scheme of Arrangement — Engro Corporation
+  merged into Dawood Hercules Corporation, which was renamed **Engro
+  Holdings Limited (ENGROH)**; ENGRO shareholders were swapped into
+  ENGROH.
+
+**Schema change:** new nullable `companies.delisted_date` (Date) via
+migration `44cd906f6e1e` (hand-written delta, chained on Session 2's
+`93dd6a13c006`), including the ENGRO backfill in the migration itself so
+any environment that applies migrations gets the fact. ENGRO's seed
+entry carries the same date for fresh DBs. Applied to live Neon and
+verified via direct SQL: `alembic_version = 44cd906f6e1e`;
+`delisted_date` column present (date, nullable); ENGRO = 2025-01-14,
+all other nine NULL.
+
+**Docs:** the KNOWN_ISSUES ENGRO entry (already root-cause-corrected in
+Session 2, old wrong explanation preserved per the file's own
+don't-erase-dead-ends rule) now carries the confirmed dates, mechanism,
+sources, and the DPS-matches-our-data proof.
+
+**Deliberately NOT done:** ENGROH was not added to `companies`. Whether
+to add it — and whether ENGRO is then dropped from the active universe
+or kept as a delisted historical record — is a ticker-universe decision
+for Abdullah (it touches seeds, the ML dataset, backtests, and stored
+reports). Flagged in the completion summary, undecided here.
+
+### Sub-step 2 — NCCPL FIPI/LIPI (probe complete; collector blocked on a dependency decision)
+
+**Probe findings (live, in a real browser — the Claude Browser pane):**
+
+- The FIPI/LIPI pages are served by a Laravel app whose real data
+  channel is an internal JSON API the pages call:
+  `GET /api/{fipi,lipi}-{normal,sector-wise}/latest-date` (freshness —
+  returned 2026-07-16, current) and
+  `POST /api/{fipi,lipi}-normal/data` `{"date": "YYYY-MM-DD"}` /
+  `POST /api/{fipi,lipi}-sector-wise/data` `{"fromDate","toDate"}`,
+  authenticated by an `X-CSRF-TOKEN` header read from the page's
+  `<meta name="csrf-token">` plus session cookie. Exact call shapes
+  extracted from the site's own inline JS, then exercised for real.
+- **Row shape (verified on live responses):** CLIENT_TYPE ×
+  MARKET_TYPE (REG/FUT/BNB/GEM/NDM/ODL + derived TOTAL rollups) with
+  BUY/SELL/NET_VOLUME, BUY/SELL/NET_VALUE (PKR, sells negative), USD;
+  sector-wise adds SEC_CODE/SECTOR_NAME.
+- **Granularity (the session's key question): sector level at best.
+  There is NO per-ticker breakdown anywhere.** ~10 named sectors
+  (Cement, Fertilizer, O&G Exploration, O&G Marketing, Commercial
+  Banks, Power, Tech, Textile Composite, Food, Debt Market) plus an
+  "All other Sectors" catch-all — the named set covers all 10 of our
+  tickers' sectors, so sector-mapped scoring is feasible next session.
+- **Archive depth: 2015-12-09 onward** via the same API (verified by
+  pulling 2015-12-09 and 2016-01-04 for real). Label drift across the
+  archive: 2015-era `FOREIGN INDIVIDUAL`/`REGULAR` vs modern
+  `FOREIGN CORPORATES ` (trailing space)/`REG`; LIPI TOTAL rows have
+  blank CLIENT_TYPE; FIPI responses wrap rows in `records`, LIPI in
+  `data`. Non-trading days: 200 + empty list.
+- **Ranged sector queries concatenate per-day rows with NO date
+  column** (6-week range → 1,267 undated rows), so collection must be
+  day-by-day: one POST per date per dataset.
+
+**The blocker, tested to a conclusion:** the entire www.nccpl.com.pk
+zone — API paths included — is behind a Cloudflare **JS challenge**.
+Plain curl/httpx: 403 challenge page. `curl_cffi` browser-TLS
+impersonation (chrome131, firefox135, safari184): all 403. The
+challenge requires actual JavaScript execution; only the real browser
+passed. curl_cffi was installed for the test and **uninstalled again**
+— not adopted. Conclusion: automated collection needs a headless
+browser (Playwright), which this project has deliberately avoided and
+which has real deployment weight on Railway (browser binaries).
+**Surfaced as a decision for Abdullah, not added.** Side note recorded
+in KNOWN_ISSUES: a yes on Playwright would also unlock the deferred
+PUCARS scraper and Dunya News scraping — one decision, three sources.
+
+**What shipped anyway (doesn't prejudge the decision):** the
+`institutional_flows` table via migration `1f70a79ddebc`, shaped by the
+verified live rows: date, dataset (fipi_normal/lipi_normal/
+fipi_sector_wise/lipi_sector_wise), client_type, sector_code/name
+(NULL for market-wide rows), market_type, buy/sell/net volume+value,
+usd_value, source, scraped_at; dedup constraint
+`UNIQUE NULLS NOT DISTINCT (date, dataset, client_type, sector_code,
+market_type)` (PG 15+ feature; live Neon confirmed PostgreSQL 17.10).
+Applied + verified via direct SQL (all 16 columns, pkey + constraint
+present via pg_get_constraintdef, 0 rows). TOTAL rollup rows are
+documented as not-to-be-stored (derived data).
+
+**Honestly NOT done (blocked, not skipped):** the collector, pipeline
+step, CLI flag, and collector-run verification. Building them without
+the fetch mechanism would have produced code that cannot be run or
+verified — the same anti-pattern this project's hard rules exist to
+prevent. They go with the Playwright decision.
+
+### Files touched
+
+Modified: `backend/app/db/models.py` (Company.delisted_date +
+InstitutionalFlow), `backend/app/collectors/seed_data.py` (ENGRO
+delisted_date), `CLAUDE.md`, `docs/KNOWN_ISSUES.md`, this file.
+New: `backend/alembic/versions/44cd906f6e1e_companies_delisted_date_column_backfill_.py`,
+`backend/alembic/versions/1f70a79ddebc_institutional_flows_table_fipi_lipi.py`.
+Dependencies: none added (curl_cffi tested and removed;
+requirements.txt untouched).
+
+**Protected files untouched:** `git diff --stat` shows only the files
+above. None of `trend_analyzer.py` / `news_synthesizer.py` /
+`filing_skeptic.py` / `orchestrator.py` / `arbitrator.py`.

@@ -17,6 +17,8 @@ FUTURE ENRICHMENT SOURCE (Phase 2B):
     updated automatically instead of using static seed values.
 """
 
+from datetime import date
+
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,10 @@ COMPANY_SEED_DATA = [
         "market_cap_pkr": 280_000_000_000.0,
         "is_kse30": True,
         "is_kmi30": True,
+        # Delisted 2025-01-14 (Scheme of Arrangement — merged into Engro
+        # Holdings, ENGROH). Last trading day 2025-01-13; PSX DPS serves
+        # price data only through 2025-01-03. See docs/KNOWN_ISSUES.md.
+        "delisted_date": date(2025, 1, 14),
     },
     {
         "ticker": "LUCK",
