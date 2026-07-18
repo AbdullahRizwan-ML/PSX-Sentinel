@@ -8,7 +8,9 @@ import {
   Brain,
   Coins,
   Hash,
+  Landmark,
   Newspaper,
+  Percent,
   Scale,
   ShieldAlert,
   TrendingUp,
@@ -882,6 +884,24 @@ function ScoreBreakdownStrip({
       icon: <Brain className="h-3.5 w-3.5" />,
     },
   ];
+  // Phase 5 Session 8 terms — only on reports generated since then.
+  // Older reports carry null/undefined here; we omit the pills
+  // entirely rather than render a fabricated 0.0 for a term that
+  // didn't exist when the report was scored.
+  if (typeof breakdown.fundamentals_contribution === "number") {
+    terms.push({
+      label: "Fundamentals",
+      value: breakdown.fundamentals_contribution,
+      icon: <Percent className="h-3.5 w-3.5" />,
+    });
+  }
+  if (typeof breakdown.flow_contribution === "number") {
+    terms.push({
+      label: "Flows",
+      value: breakdown.flow_contribution,
+      icon: <Landmark className="h-3.5 w-3.5" />,
+    });
+  }
   const sum = terms.reduce((s, t) => s + t.value, 0);
 
   return (

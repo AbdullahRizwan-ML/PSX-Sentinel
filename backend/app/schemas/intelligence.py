@@ -41,6 +41,66 @@ class MlDetail(BaseModel):
     model_caveat: str | None = None
 
 
+class FundMetricRank(BaseModel):
+    """
+    One metric's peer-rank record inside ``FundamentalsDetail``.
+    ``used=False`` + ``reason`` documents WHY a metric was excluded
+    (e.g. PSX Terminal's literal-0.0 dividend yields for LUCK/MARI) —
+    the "distinguish real zero from no/bad data" discipline.
+    """
+
+    used: bool
+    value: float | None = None
+    n_ranked: int | None = None
+    percentile: float | None = None
+    tilt: float | None = None
+    reason: str | None = None
+
+
+class FundamentalsDetail(BaseModel):
+    """
+    Audit detail for the Phase 5 Session 8 fundamentals value tilt.
+    Mirrors the ``fundamentals_detail`` dict persisted by
+    ``Arbitrator._fundamentals_contribution``. Always emitted (even at
+    0.0) so consumers can tell a computed-zero from an honest skip.
+    """
+
+    used: bool
+    skip_reason: str | None = None
+    metrics: dict[str, FundMetricRank] | None = None
+    combined_points: float | None = None
+    metric_magnitude_points: float | None = None
+    peer_universe_size: int | None = None
+    caveat: str | None = None
+
+
+class FlowDetail(BaseModel):
+    """
+    Audit detail for the Phase 5 Session 8 sector FIPI/LIPI flow
+    regime term. Mirrors the ``flow_detail`` dict persisted by
+    ``Arbitrator._flow_contribution``. ``skip_reason`` distinguishes
+    the honest-zero paths (stale data / unmapped sector / not enough
+    days) from a genuine near-zero flow reading.
+    """
+
+    used: bool
+    skip_reason: str | None = None
+    sector: str | None = None
+    nccpl_sectors: list[str] | None = None
+    variant: str | None = None
+    latest_flow_date: str | None = None
+    window_days: int | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    net_value_pkr: float | None = None
+    gross_value_pkr: float | None = None
+    imbalance_ratio: float | None = None
+    scale: float | None = None
+    magnitude_points: float | None = None
+    staleness_days: int | None = None
+    stale_threshold_days: int | None = None
+
+
 class ScoreBreakdown(BaseModel):
     """
     Per-term contributions that sum (plus the base of 50) to the
@@ -49,6 +109,10 @@ class ScoreBreakdown(BaseModel):
     Mirrors the ``score_breakdown`` dict emitted by
     ``Arbitrator._build_score_breakdown`` and persisted under
     ``IntelligenceReport.agent_outputs['arbitrator']['output']``.
+
+    The two Phase 5 Session 8 terms (fundamentals/flow) are optional:
+    ``None`` on any report generated before that session — visibly
+    distinct from a computed 0.0.
     """
 
     technical_contribution: float
@@ -56,6 +120,10 @@ class ScoreBreakdown(BaseModel):
     filing_contribution: float
     ml_contribution: float
     ml_detail: MlDetail | None = None
+    fundamentals_contribution: float | None = None
+    flow_contribution: float | None = None
+    fundamentals_detail: FundamentalsDetail | None = None
+    flow_detail: FlowDetail | None = None
 
 
 class NewsSynthesis(BaseModel):

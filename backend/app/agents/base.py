@@ -69,6 +69,25 @@ class AgentContext(BaseModel):
     # unavailable (legacy reports, missing model.json, etc.).
     ml_signal: dict = {}
 
+    # Phase 5 Session 8 — also populated by the orchestrator (pure
+    # data pulls, no LLM involved), consumed only by the Arbitrator's
+    # two deterministic score terms:
+    #
+    # peer_fundamentals: {ticker: {"pe_ratio": float|None,
+    #   "dividend_yield": float|None}} for every ACTIVE (non-delisted)
+    #   company that has a company_fundamentals row. The Arbitrator
+    #   ranks context.ticker against this universe for the
+    #   fundamentals value tilt.
+    #
+    # sector_flows: sector-level NCCPL FIPI/LIPI daily aggregates for
+    #   the ticker's mapped sector(s) — see
+    #   AnalysisOrchestrator._build_sector_flows for the exact shape
+    #   and the variant definition. Empty dict = not populated
+    #   (legacy callers), which the Arbitrator treats as an honest
+    #   zero with a logged reason.
+    peer_fundamentals: dict = {}
+    sector_flows: dict = {}
+
 
 class AgentResult(BaseModel):
     """

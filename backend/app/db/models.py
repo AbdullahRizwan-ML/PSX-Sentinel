@@ -452,6 +452,17 @@ class IntelligenceReport(Base):
     agent_outputs: Mapped[dict] = mapped_column(
         JSON, nullable=False, default=dict
     )  # Raw outputs from each agent
+    # Phase 5 Session 8 — the two deterministic score terms, stored as
+    # first-class columns for direct-SQL auditability (the four legacy
+    # terms live only in agent_outputs JSON). NULLABLE on purpose:
+    # NULL = report predates the terms; 0.0 = term ran, contributed
+    # nothing (honest-zero discipline, same as filing_contribution).
+    fundamentals_contribution: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )  # peer-rank value tilt, clamped [-10, +10]
+    flow_contribution: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )  # sector FIPI/LIPI regime, staleness-gated, clamped [-10, +10]
     total_tokens_used: Mapped[int] = mapped_column(Integer, default=0)
     total_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     generation_time_seconds: Mapped[float] = mapped_column(Float, default=0.0)

@@ -3158,3 +3158,1110 @@ Docs: `CLAUDE.md`, `docs/KNOWN_ISSUES.md`, this file.
 
 **`trend_analyzer.py`, `news_synthesizer.py`, `arbitrator.py` untouched**
 — verified via `git diff --name-only` (they do not appear at all).
+
+## 2026-07-18 — Phase 5 Session 8: fundamentals tilt + FIPI/LIPI flow regime signal
+
+**What shipped:** two new, independent, fully deterministic conviction-score
+terms — a peer-rank **fundamentals value tilt** (±10) and a sector-level
+**FIPI/LIPI institutional-flow regime** signal (±10) — completing the
+data-to-scoring pipeline for everything the DB already holds. No LLM judgment
+is involved in either term (unlike FilingSceptic): both are pure calculations
+on `company_fundamentals` and `institutional_flows`, computed inside the
+Arbitrator, included in the clamped [0,100] score, persisted to two new
+first-class columns AND the `score_breakdown` JSON, exposed through the API
+schema, and rendered as two new pills on the frontend breakdown strip.
+
+**Protected-file scope (honored):** `arbitrator.py` and `orchestrator.py`
+were modified under this session's explicit permission (full diffs pasted at
+the bottom of this entry). `git diff --name-only` confirms
+**`trend_analyzer.py`, `news_synthesizer.py`, `filing_skeptic.py` do NOT
+appear in the diff.** `base.py` (never on the protected list; same precedent
+as Phase 3 Session 3's `ml_signal`) gained two AgentContext fields.
+
+### Part 1 — current shape, confirmed from code (not memory)
+
+- The formula was exactly as documented: `50 + technical(±20, SIGNAL_MAP ×
+  confidence) + news(±15, SENTIMENT_MAP × confidence) + filing(−5/−15/−30 on
+  red flags) + ml(±5, gated at max_prob > 0.55)`, clamped
+  `max(0.0, min(100.0, score))` in `Arbitrator._calculate_score`.
+- **`intelligence_reports` had NO per-term columns.** The four legacy terms
+  live only inside `agent_outputs['arbitrator']['output']['score_breakdown']`
+  (JSON), hoisted into the API by the Pydantic validator. So the "existing
+  pattern" for breakdown storage is JSON + schema hoist — the two new columns
+  are the **first** first-class per-term columns, added on top of (not
+  instead of) the JSON so the API/frontend path stays uniform and the new
+  deterministic terms are auditable by direct SQL. Nullable on purpose:
+  NULL = "term didn't exist when this report was scored" vs 0.0 = "computed,
+  contributed nothing".
+
+### Part 2 — schema (migration `1575e060ba63`)
+
+`intelligence_reports.fundamentals_contribution` + `.flow_contribution`
+(both Float, nullable), `down_revision=1f70a79ddebc`. Applied and verified
+against live Neon before any scoring code ran: `information_schema` shows
+both columns as nullable `double precision`; all 25 pre-existing rows NULL;
+`alembic_version=1575e060ba63`. `models.py` updated to match.
+
+### Part 3 — fundamentals tilt (±10), exact formula
+
+For the analyzed ticker against the ACTIVE universe (non-delisted companies
+with a `company_fundamentals` row; 10 tickers today):
+
+```
+pct        = average-rank percentile of the ticker's value among all
+             VALID values for that metric (0 = lowest, 1 = highest,
+             ties share average rank)
+tilt_pe    = (0.5 − pct(P/E))            × 2      # cheaper than peers → +
+tilt_yield = (pct(dividend_yield) − 0.5) × 2      # higher than peers  → +
+fundamentals_contribution = clamp(5·tilt_pe + 5·tilt_yield, −10, +10)
+```
+
+Each metric is worth up to ±5; an **excluded metric contributes exactly 0 —
+deliberately NOT renormalized**, so a ticker with less usable evidence gets
+a smaller possible swing, not an amplified one (MARI: worst P/E −5.0, yield
+excluded → −5.0 total, not −10).
+
+**Known-bad data is excluded, not used as real** (Part 3.2 of the brief):
+
+- P/E valid iff present and > 0.
+- dividend_yield valid iff present and **> 0.0** — PSX Terminal serves a
+  literal 0.0 when it has no dividend data (documented for LUCK and MARI,
+  both of which do pay dividends; KNOWN_ISSUES). The rule is
+  source-behavioral, not a ticker hardcode, so any future zeroed-out ticker
+  gets the same treatment. ENGROH's NULL yield is excluded the same way.
+- A metric also needs ≥ 4 valid values across the universe
+  (`FUND_MIN_RANKED`) before a percentile means anything.
+
+Every exclusion is logged per metric in the persisted
+`fundamentals_detail.metrics[metric] = {used, value, n_ranked, percentile,
+tilt, reason}` — same real-zero-vs-no-data discipline as the filing term.
+The detail block also carries the mandated small-universe caveat verbatim:
+a ~10-ticker peer ranking is statistically weak by construction; it is a
+relative tilt, not a valuation model.
+
+Live values (2026-07-18): P/E ranks all 10; yield ranks 7 (LUCK 0.0 + MARI
+0.0 excluded-suspect, ENGROH NULL).
+
+### Part 4 — FIPI/LIPI regime signal (±10), variant/window chosen from data
+
+**Structural finding first:** FIPI net + LIPI net over ALL client types is
+**exactly zero per sector** (verified on real rows — every foreign net buy
+is a local net sell by accounting identity), so "FIPI+LIPI combined" is only
+meaningful as a non-retail subset. The tested variants:
+
+| group | variant | win | pearson | spearman | lag1_ac | flip_rate | abs_p90 |
+|---|---|---|---|---|---|---|---|
+| Commercial Banks | fipi_only | 5 | +0.113 | +0.106 | 0.939 | 0.079 | 0.592 |
+| Commercial Banks | fipi_only | 10 | +0.143 | +0.128 | 0.978 | 0.046 | 0.551 |
+| Commercial Banks | fipi_inst | 5 | +0.007 | +0.003 | 0.855 | 0.158 | 0.129 |
+| Commercial Banks | fipi_inst | 10 | +0.030 | −0.016 | 0.944 | 0.092 | 0.103 |
+| Oil & Gas (both) | fipi_only | 5 | **−0.134** | −0.159 | 0.914 | 0.120 | 0.348 |
+| Oil & Gas (both) | fipi_only | 10 | **−0.110** | −0.135 | 0.966 | 0.068 | 0.303 |
+| Oil & Gas (both) | fipi_inst | 5 | +0.053 | +0.050 | 0.860 | 0.162 | 0.176 |
+| Oil & Gas (both) | fipi_inst | 10 | +0.047 | +0.050 | 0.938 | 0.107 | 0.142 |
+| Cement | fipi_only | 5 | +0.069 | +0.077 | 0.924 | 0.115 | 0.517 |
+| Cement | fipi_only | 10 | +0.093 | +0.105 | 0.973 | 0.073 | 0.444 |
+| Cement | fipi_inst | 5 | +0.096 | +0.099 | 0.876 | 0.154 | 0.175 |
+| Cement | fipi_inst | 10 | +0.061 | +0.072 | 0.943 | 0.093 | 0.132 |
+
+(`fipi_inst` = FIPI + LIPI over all client types EXCEPT INDIVIDUALS and
+BROKER PROPRIETARY TRADING; REG market; correlation is vs forward
+5-trading-day equal-weight split-adjusted sector return of our own tickers;
+full history 2021-06 → 2026-07, n≈1,250/group.)
+
+**Decision: `fipi_inst`, 10-day window.** FIPI-only anti-correlates for O&G
+(−0.11..−0.13) while correlating positively for Banks (+0.14) — its sign
+meaning is sector-inconsistent, so scoring with it would reward foreign
+buying in one sector and punish it in another with no stated reason.
+`fipi_inst` is weakly positive in all three groups both windows, and 10-day
+is markedly more regime-like than 5-day (lag-1 autocorr 0.94 vs 0.86,
+sign-flip rate ~9% vs ~16%). **Honest read: mean correlation ~+0.05 — this
+is a regime descriptor ("institutions are accumulating/distributing this
+sector"), not a return predictor.** Documented as such everywhere.
+
+**Exact formula:**
+
+```
+ratio = Σ net_value / Σ gross_value  over the last ≤10 flow trading days
+        for the ticker's mapped NCCPL sector(s)
+        (net = FIPI + local-institutional LIPI net PKR; gross = buy + |sell|)
+flow_contribution = clamp(ratio / 0.125, −1, +1) × 10
+```
+
+`FLOW_SCALE = 0.125` ≈ the pooled historical p90 of |10-day ratio| (measured
+0.1258 over the full archive) — a historically-extreme regime maps to the
+full ±10, a median day (~0.047) to ~±3.8.
+
+**Sector mapping** uses `companies.sector` as the key (per the brief — no
+rebuilt per-ticker mapping) with a translation to NCCPL's vocabulary:
+Banking → Commercial Banks; Cement → Cement; **Oil & Gas → BOTH NCCPL O&G
+sectors summed** (our coarse label can't split OGDC/PPL/MARI-exploration
+from PSO-marketing — a documented granularity loss). **"Investment
+Companies" (ENGROH) is deliberately UNMAPPED**: its NCCPL home is the "All
+other Sectors" catch-all, which mixes dozens of unrelated sectors — using it
+would fabricate signal, so ENGROH gets an honest zero with reason
+`sector_not_covered_by_nccpl` (verified live below).
+
+**Staleness gate (mandatory, Part 4.2): 14 calendar days.** Reasoning: the
+flows table is refreshed **manually** via the browser pane (automated
+collection is Cloudflare-blocked — Problem B, still unsolved), realistically
+~weekly; 14 days absorbs one missed weekly refresh plus a holiday cluster,
+while guaranteeing a dead feed degrades to silence within two weeks instead
+of scoring tickers on month-old regimes. Gate is applied in the Arbitrator
+(scoring policy, visible in the breakdown): newest flow row used >14 days
+older than `report_date` → 0.0 with reason `stale_flow_data (...)` + a
+logged warning + `staleness_days`/`stale_threshold_days` in `flow_detail`.
+Other honest-zero paths, each with a distinct machine-readable reason:
+`no_flow_context`, `sector_not_covered_by_nccpl`,
+`insufficient_flow_history` (<5 days), `zero_gross_turnover`.
+
+### Part 5 — wiring
+
+- **base.py:** `AgentContext.peer_fundamentals` + `.sector_flows` (both
+  `dict = {}`, documented; agents 1–3 never read them).
+- **orchestrator.py:** `_build_peer_fundamentals()` (active universe join,
+  values passed through as stored — validity is the Arbitrator's call) and
+  `_build_sector_flows()` (the SQL variant aggregation above, day-limited,
+  plus global `MAX(date)` freshness); both wired into `_build_context`
+  (which now takes `company.sector`); the two new columns persisted from the
+  arbitrator's breakdown (`None` if the Arbitrator failed outright — "not
+  computed" ≠ 0.0); log line extended.
+- **arbitrator.py:** both terms computed ONCE in `run()` as
+  `(points, detail)` tuples, threaded through `_calculate_score` (which now
+  adds them before the [0,100] clamp), `_build_score_breakdown` (values +
+  always-present detail blocks), and a new `DETERMINISTIC SCORE TILTS`
+  prompt section (`_render_tilts_block`) so the narrative LLM can account
+  for the score honestly — including the skip reason when a term is an
+  honest zero. Envelope is now 110/−40 raw, so the clamp is load-bearing.
+
+### Part 6 — frontend (display only)
+
+`ScoreBreakdown`/`FundamentalsDetail`/`FlowDetail`/`FundMetricRank` Pydantic
+schemas (backend) mirrored into `types.ts`; `ScoreBreakdownStrip` appends
+"Fundamentals" (Percent icon) and "Flows" (Landmark icon) pills **only when
+the values are present** — legacy reports keep the 4-pill layout instead of
+showing fabricated 0.0s for terms that didn't exist when they were scored.
+`npx tsc --noEmit` exits 0.
+
+### Verification (all mandatory items)
+
+**Before/after, same 6 tickers (real production-path runs, real LLM calls;
+snapshots `s8_baseline.json`/`s8_after.json`, diffed by
+`scripts/verify_fundamentals_flow.py --diff`):**
+
+| ticker | conviction before | after | tech | news | filing | ml | **fund** | **flow** |
+|---|---|---|---|---|---|---|---|---|
+| PPL | 41.5 | **30.6** | −8.5 → −8.5 | 0.0 | 0.0 | 0.0 | **−1.67** | **−9.23** |
+| MCB | 50.0 | **53.7** | 0.0 | 0.0 | 0.0 | 0.0 | **+3.33** | **+0.41** |
+| LUCK | 50.0 | **49.6** | 0.0 | 0.0 | 0.0 | 0.0 | **+0.56** | **−0.94** |
+| MARI | 50.0 | **35.8** | 0.0 | 0.0 | 0.0 | 0.0 | **−5.0** | **−9.23** |
+| ENGROH | 50.0 | **53.9** | 0.0 | 0.0 | 0.0 | 0.0 | **+3.89** | **0.0** |
+| PSO | 35.0 | **25.8** | 0.0 | 0.0 | −15 → −15 | 0.0 | **0.0** | **−9.23** |
+
+- **Isolation proof: 24/24 legacy terms byte-identical** across all 6
+  tickers (incl. PPL's −8.5 technical and PSO's −15 filing). Only the two
+  new terms appeared.
+- **Exclusion logic fired and is visible** (Part 3.2): LUCK and MARI both
+  show `dividend_yield: used=false, value=0.0,
+  reason="missing_or_zero_at_source (PSX Terminal serves literal 0.0…)"` in
+  the persisted `fundamentals_detail`; ENGROH shows the same for its NULL
+  yield. MARI's −5.0 (not −10) proves the no-renormalization rule.
+- **PSO is the perfect computed-zero example:** cheapest P/E (+5) exactly
+  cancels lowest-valid-yield (−5) → fundamentals 0.0 with BOTH metrics
+  `used=true` — visibly different from LUCK's exclusion zero.
+- **ENGROH flow honest zero:** `skip_reason=sector_not_covered_by_nccpl`,
+  as designed; its NCCPL catch-all was NOT used as a proxy.
+- **O&G flow regime is real and current:** ratio −0.1154 over
+  2026-07-06→2026-07-17 (10 days, staleness 1 day) → −9.23 for
+  PPL/MARI/PSO alike; Banks +0.0051 → +0.41; Cement −0.0117 → −0.94.
+- **Staleness path deliberately tested** (it can't trigger live today —
+  data is 1 day old): the production `_flow_contribution` was run in-process
+  with a synthetic 20-day-old window → `0.0`,
+  `skip_reason="stale_flow_data (newest flow row 2026-06-28 is 20 days
+  before report_date 2026-07-18; threshold 14)"`, plus the logged warning.
+  Also exercised: `sector_not_covered_by_nccpl`, `insufficient_flow_history
+  (3 days)`, `zero_gross_turnover`, `no_fundamentals_row` (ENGRO).
+- **Clamp verified with both terms in play:** synthetic max-everything
+  (raw 110) → 100.0; min-everything (raw −40) → 0.0, through the production
+  `_calculate_score`. All six real runs hand-checked arithmetically
+  (e.g. PSO 50−15−9.23=25.77→25.8; MCB 50+3.33+0.41=53.74→53.7); none hit
+  the clamp today.
+- **Hand-check of the ranking math:** MCB P/E 8.29 is 7th of 10 → pct
+  0.6667 → tilt −0.3333 → −1.67; yield 9.05 is highest of 7 → +5.0; total
+  +3.33 — matches the live run exactly.
+- **DB columns = JSON breakdown byte-for-byte** in all 6 rows (direct SQL);
+  legacy rows stay NULL (31 total rows, 6 non-null).
+- **API path:** `IntelligenceReportResponse.model_validate` over the fresh
+  ORM rows serves the typed detail blocks (exclusion reasons + skip_reasons
+  intact); the **oldest legacy row (PPL 2026-06-23) still validates** with
+  `fundamentals_contribution=None/flow_contribution=None`. Verified again
+  over real HTTP (`GET /companies/{t}/report` with a fresh JWT) for
+  PPL/LUCK/ENGROH/PSO after busting the Redis report cache.
+- **Gateway routing regression:** all 20 after-run `llm_calls` rows are
+  llama-3.3-70b-versatile via the gateway; the new terms make **zero** LLM
+  calls (they're deterministic — no new agent, no new call sites).
+- **In-browser render (Claude Preview):** `/companies/PPL` shows the
+  six-pill strip (Base +50.0, Technical −8.5, News 0.0, Filings 0.0, ML
+  0.0, Fundamentals −1.7, Flows −9.2 = 30.6) and the Arbitrator's narrative
+  references the tilt with its small-universe caveat; `/companies/UBL`
+  (pre-change report) correctly renders the legacy **4-pill** strip with no
+  fabricated zeros. Zero console errors. *Honest gap: the preview pane's
+  pixel-screenshot tool timed out repeatedly this session (canvas-heavy
+  page), so the visual proof is DOM-extraction-based rather than a
+  screenshot.* Both dev servers stopped; ports 3000/8000 confirmed clear
+  via literal netstat.
+
+**Cost note:** the two new terms add ~2 small SQL queries per analysis and
+no LLM tokens. Arbitrator prompt grew by the ~4-line tilts block
+(few dozen tokens).
+
+### Files changed
+
+- `backend/alembic/versions/1575e060ba63_intelligence_reports_fundamentals_flow_.py` (new)
+- `backend/app/db/models.py` (+2 columns)
+- `backend/app/agents/base.py` (+2 AgentContext fields)
+- `backend/app/agents/orchestrator.py` (protected; permitted — diff below)
+- `backend/app/agents/arbitrator.py` (protected; permitted — diff below)
+- `backend/app/schemas/intelligence.py` (+3 detail schemas, ScoreBreakdown extended)
+- `backend/scripts/verify_fundamentals_flow.py` (new harness, --save/--diff)
+- `frontend/src/lib/api/types.ts`, `frontend/src/app/(app)/companies/[ticker]/page.tsx` (display only)
+- `.gitignore` (+verification-snapshot patterns)
+
+### Full diff — backend/app/agents/orchestrator.py
+
+```diff
+diff --git a/backend/app/agents/orchestrator.py b/backend/app/agents/orchestrator.py
+index eec943d..cdcfb67 100644
+--- a/backend/app/agents/orchestrator.py
++++ b/backend/app/agents/orchestrator.py
+@@ -21,7 +21,7 @@ import uuid
+ from datetime import date, datetime, timedelta
+ 
+ from loguru import logger
+-from sqlalchemy import select
++from sqlalchemy import bindparam, select, text
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.agents.arbitrator import Arbitrator
+@@ -34,6 +34,7 @@ from app.core.redis_client import redis_client
+ from app.db.models import (
+     Announcement,
+     Company,
++    CompanyFundamentals,
+     DailyPrice,
+     IntelligenceReport,
+     NewsArticle,
+@@ -48,6 +49,92 @@ from app.ml.inference import predict_from_prices
+ # work from a richer-than-before history. Pre-Session-3 this was 365.
+ PRICE_WINDOW_DAYS = 600
+ 
++# ── Phase 5 Session 8: sector-flow context (FIPI/LIPI regime term) ──
++#
++# companies.sector label → NCCPL sector-wise sector_name list. NCCPL's
++# finest granularity is sector level (never per-ticker) and its
++# vocabulary differs from ours:
++#   - Our coarse "Oil & Gas" bucket spans BOTH NCCPL O&G sectors
++#     (OGDC/PPL/MARI are Exploration, PSO is Marketing — our sector
++#     label can't tell them apart, so both NCCPL sectors are summed;
++#     a documented granularity loss, not a bug).
++#   - "Investment Companies" (ENGROH) has NO named NCCPL sector — it
++#     falls inside NCCPL's "All other Sectors" catch-all, which mixes
++#     dozens of unrelated sectors. Mapping it there would fabricate a
++#     signal, so it is deliberately UNMAPPED → the Arbitrator emits an
++#     honest-zero flow term with reason "sector_not_covered_by_nccpl".
++NCCPL_SECTOR_MAP: dict[str, list[str]] = {
++    "Banking": ["Commercial Banks"],
++    "Cement": ["Cement"],
++    "Oil & Gas": [
++        "Oil and Gas Exploration Companies",
++        "Oil and Gas Marketing Companies",
++    ],
++}
++
++# Trading-day lookback for the flow window (chosen over 5 in the
++# Session 8 exploration: lag-1 autocorrelation 0.94 vs 0.86, sign-flip
++# rate ~9% vs ~16% — more regime-like, which is what this term claims
++# to measure). The Arbitrator enforces its own minimum-days and
++# staleness gates on whatever this fetch returns.
++FLOW_LOOKBACK_DAYS = 10
++
++# LIPI client types EXCLUDED from the flow variant. The chosen variant
++# is "foreign + local institutional" (FIPI net + LIPI net over every
++# non-retail client type), because FIPI + LIPI over ALL client types
++# is structurally zero — every foreign net buy is a local net sell by
++# accounting identity (verified live on real rows, Session 8) — and
++# FIPI-only anti-correlated with forward sector returns for O&G in the
++# 2021-2026 exploration while correlating positively for Banks, i.e.
++# its sign meaning was sector-inconsistent. Full comparison table in
++# docs/BUILD_LOG.md (Session 8).
++LIPI_RETAIL_TYPES = ["INDIVIDUALS", "BROKER PROPRIETARY TRADING"]
++
++FLOW_VARIANT = (
++    "fipi_plus_local_institutional (REG market, sector-wise datasets; "
++    "LIPI minus INDIVIDUALS/BROKER PROPRIETARY TRADING)"
++)
++
++# One row per flow trading day for the mapped sectors: net and gross
++# (buy + |sell|; sells are stored negative, hence buy - sell) PKR
++# turnover of the chosen variant. REGULAR is the pre-2025-05 spelling
++# of REG in the FIPI archive rows — both are the cash equities market.
++_SECTOR_FLOW_SQL = (
++    text(
++        """
++        SELECT date,
++               SUM(CASE
++                     WHEN dataset = 'fipi_sector_wise'
++                       THEN COALESCE(net_value, 0)
++                     WHEN dataset = 'lipi_sector_wise'
++                          AND client_type NOT IN :retail
++                       THEN COALESCE(net_value, 0)
++                     ELSE 0
++                   END) AS net_value,
++               SUM(CASE
++                     WHEN dataset = 'fipi_sector_wise'
++                       THEN COALESCE(buy_value, 0) - COALESCE(sell_value, 0)
++                     WHEN dataset = 'lipi_sector_wise'
++                          AND client_type NOT IN :retail
++                       THEN COALESCE(buy_value, 0) - COALESCE(sell_value, 0)
++                     ELSE 0
++                   END) AS gross_value
++        FROM institutional_flows
++        WHERE dataset IN ('fipi_sector_wise', 'lipi_sector_wise')
++          AND market_type IN ('REG', 'REGULAR')
++          AND sector_name IN :sectors
++          AND date <= :report_date
++        GROUP BY date
++        ORDER BY date DESC
++        LIMIT :lookback
++        """
++    )
++    .bindparams(
++        bindparam("retail", expanding=True),
++        bindparam("sectors", expanding=True),
++    )
++)
++
+ 
+ class AnalysisOrchestrator:
+ 
+@@ -80,7 +167,7 @@ class AnalysisOrchestrator:
+         await self.db.flush()
+ 
+         context = await self._build_context(
+-            ticker, company.name, str(report_id)
++            ticker, company.name, company.sector, str(report_id)
+         )
+ 
+         # Compute the point-in-time ML price-direction signal
+@@ -106,7 +193,11 @@ class AnalysisOrchestrator:
+             f"ml_signal=available={context.ml_signal.get('available')} "
+             f"gate={context.ml_signal.get('gate_passed')} "
+             f"class={context.ml_signal.get('predicted_class')} "
+-            f"p={context.ml_signal.get('max_prob')}"
++            f"p={context.ml_signal.get('max_prob')}, "
++            f"fundamentals_peers={len(context.peer_fundamentals)}, "
++            f"flow_days={len(context.sector_flows.get('daily') or [])} "
++            f"(sector='{context.sector_flows.get('sector')}' -> "
++            f"{context.sector_flows.get('nccpl_sectors')})"
+         )
+ 
+         trend_result = await trend_agent.run_safe(context)
+@@ -153,6 +244,16 @@ class AnalysisOrchestrator:
+             "bear_case", "Analysis incomplete."
+         )
+         report.risk_factors = arb_output.get("risk_factors", [])
++        # Phase 5 Session 8: the two deterministic terms also land in
++        # first-class nullable columns for direct-SQL auditability.
++        # dict.get() keeps them None (not 0.0) when the Arbitrator
++        # failed outright and produced no breakdown — None means "not
++        # computed", 0.0 means "computed, contributed nothing".
++        breakdown = arb_output.get("score_breakdown") or {}
++        report.fundamentals_contribution = breakdown.get(
++            "fundamentals_contribution"
++        )
++        report.flow_contribution = breakdown.get("flow_contribution")
+         report.agent_outputs = {
+             r.agent_name: {
+                 "output": r.output,
+@@ -201,7 +302,11 @@ class AnalysisOrchestrator:
+         return company
+ 
+     async def _build_context(
+-        self, ticker: str, company_name: str, analysis_id: str
++        self,
++        ticker: str,
++        company_name: str,
++        sector: str,
++        analysis_id: str,
+     ) -> AgentContext:
+         cutoff_price = date.today() - timedelta(days=PRICE_WINDOW_DAYS)
+         price_result = await self.db.execute(
+@@ -275,6 +380,11 @@ class AnalysisOrchestrator:
+             for a in announcements_db
+         ]
+ 
++        peer_fundamentals = await self._build_peer_fundamentals()
++        sector_flows = await self._build_sector_flows(
++            sector, date.today()
++        )
++
+         return AgentContext(
+             ticker=ticker,
+             company_name=company_name,
+@@ -283,4 +393,103 @@ class AnalysisOrchestrator:
+             recent_prices=recent_prices,
+             news_articles=news_articles,
+             announcements=announcements,
++            peer_fundamentals=peer_fundamentals,
++            sector_flows=sector_flows,
++        )
++
++    async def _build_peer_fundamentals(self) -> dict:
++        """
++        Latest fundamentals snapshot for every ACTIVE (non-delisted)
++        company that has a company_fundamentals row, keyed by ticker.
++
++        Only the two metrics the Arbitrator's fundamentals tilt ranks
++        on are carried (pe_ratio, dividend_yield). Values are passed
++        through EXACTLY as stored — including PSX Terminal's
++        literal-0.0 dividend yields (documented suspect for LUCK/MARI)
++        and NULLs — because deciding what counts as usable data is the
++        Arbitrator's job, where the exclusion is logged per ticker in
++        the persisted score breakdown.
++        """
++        result = await self.db.execute(
++            select(
++                CompanyFundamentals.ticker,
++                CompanyFundamentals.pe_ratio,
++                CompanyFundamentals.dividend_yield,
++            )
++            .join(Company, CompanyFundamentals.ticker == Company.ticker)
++            .where(Company.delisted_date.is_(None))
++        )
++        return {
++            row.ticker: {
++                "pe_ratio": row.pe_ratio,
++                "dividend_yield": row.dividend_yield,
++            }
++            for row in result.all()
++        }
++
++    async def _build_sector_flows(
++        self, sector: str, report_date: date
++    ) -> dict:
++        """
++        Sector-level NCCPL FIPI/LIPI daily aggregates for the ticker's
++        mapped sector(s), for the Arbitrator's flow-regime term.
++
++        Shape:
++            {
++              "sector":           companies.sector label,
++              "nccpl_sectors":    mapped NCCPL sector_name list
++                                  ([] when the sector is unmapped —
++                                  the Arbitrator turns that into an
++                                  honest zero with a logged reason),
++              "variant":          human-readable variant definition,
++              "latest_flow_date": global MAX(date) in
++                                  institutional_flows (None when the
++                                  table is empty) — how fresh our flow
++                                  archive is at all,
++              "daily":            up to FLOW_LOOKBACK_DAYS most recent
++                                  flow trading days (ascending), each
++                                  {"date", "net_value", "gross_value"}
++                                  in PKR for the chosen variant.
++            }
++
++        The staleness gate itself lives in the Arbitrator (it is a
++        scoring-policy decision and must be visible in the score
++        breakdown) — this method only reports the dates honestly.
++        """
++        mapped = NCCPL_SECTOR_MAP.get(sector, [])
++
++        latest_row = await self.db.execute(
++            text("SELECT MAX(date) AS d FROM institutional_flows")
+         )
++        latest_flow_date = latest_row.scalar_one_or_none()
++
++        daily: list[dict] = []
++        if mapped:
++            rows = await self.db.execute(
++                _SECTOR_FLOW_SQL,
++                {
++                    "retail": LIPI_RETAIL_TYPES,
++                    "sectors": mapped,
++                    "report_date": report_date,
++                    "lookback": FLOW_LOOKBACK_DAYS,
++                },
++            )
++            daily = [
++                {
++                    "date": str(r.date),
++                    "net_value": float(r.net_value or 0.0),
++                    "gross_value": float(r.gross_value or 0.0),
++                }
++                for r in rows.all()
++            ]
++            daily.reverse()  # fetched DESC for the LIMIT; serve ascending
++
++        return {
++            "sector": sector,
++            "nccpl_sectors": mapped,
++            "variant": FLOW_VARIANT,
++            "latest_flow_date": (
++                str(latest_flow_date) if latest_flow_date else None
++            ),
++            "daily": daily,
++        }
+```
+
+### Full diff — backend/app/agents/arbitrator.py
+
+```diff
+diff --git a/backend/app/agents/arbitrator.py b/backend/app/agents/arbitrator.py
+index ad8b80e..e3614b8 100644
+--- a/backend/app/agents/arbitrator.py
++++ b/backend/app/agents/arbitrator.py
+@@ -23,6 +23,47 @@ Score formula (max absolute swing in parens):
+             if there isn't enough history to build features, this term
+             contributes 0.0 — same "honest zero" treatment as
+             filing_contribution when no filing data exists.
++      ± 10  fundamentals_contribution (Phase 5 Session 8) —
++            deterministic value tilt from peer-percentile ranks over
++            the ACTIVE universe (~10 tickers):
++                tilt_pe    = (0.5 − pct_rank(P/E))            × 2
++                tilt_yield = (pct_rank(dividend_yield) − 0.5) × 2
++                contribution = clamp(5·tilt_pe + 5·tilt_yield, −10, +10)
++            (cheaper-than-peers P/E and higher-than-peers yield tilt
++            positive; each metric is worth up to ±5 and an
++            excluded/missing metric contributes 0 — NOT renormalized,
++            so less evidence means a smaller possible swing).
++            Known-bad source data is EXCLUDED, not treated as real:
++            dividend_yield of exactly 0.0 (PSX Terminal serves literal
++            0.0 when it has no dividend data — documented for
++            LUCK/MARI, both of which do pay dividends) and NULLs are
++            per-ticker exclusions logged in the score breakdown.
++            CAVEAT: a peer ranking over a 10-ticker universe is
++            statistically weak by construction — it is a relative
++            tilt within this small universe, not a valuation model.
++      ± 10  flow_contribution (Phase 5 Session 8) — deterministic
++            sector-level FIPI/LIPI institutional-flow regime:
++                ratio = Σ net / Σ gross over the last ≤10 flow trading
++                        days for the ticker's mapped NCCPL sector(s)
++                        (variant: FIPI + local-institutional LIPI, REG
++                        market; net PKR / (buy + |sell|) PKR)
++                contribution = clamp(ratio / FLOW_SCALE, −1, +1) × 10
++            FLOW_SCALE = 0.125 ≈ the 90th percentile of |ratio| over
++            the full 2021-06→2026-07 archive (pooled across the three
++            mapped sector groups), so a historically-extreme flow
++            regime maps to the full ±10 and a median day to ~±4.
++            STALENESS-GATED: if the flow data used ends more than
++            FLOW_STALE_DAYS (14) calendar days before report_date the
++            term contributes 0.0 with reason "stale_flow_data" — an
++            honest "we didn't use this because it's too old", visibly
++            distinct from a real near-zero flow reading. Unmappable
++            sectors (ENGROH's "Investment Companies" has no named
++            NCCPL sector) are an honest zero too, never silently
++            proxied by NCCPL's "All other Sectors" catch-all.
++
++    Max possible envelope is now 50+20+15+5+10+10 = 110 and
++    50−20−15−30−5−10−10 = −40, so the final clamp to [0, 100] in
++    _calculate_score is load-bearing, not just defensive.
+ 
+ Why ML gets only 5 (not the originally-planned 15):
+     The trained XGBoost model scored +6pp over a 3-class random
+@@ -32,9 +73,20 @@ Why ML gets only 5 (not the originally-planned 15):
+     matches the Session 2 recommendation: small voice, only speaks
+     when relatively sure, never dominant. See docs/BUILD_LOG.md
+     Phase 3 Session 2 for the full evaluation that drove this choice.
++
++Why the two Session 8 terms get 10 each:
++    Both are deterministic calculations on real but weak evidence — a
++    10-ticker peer rank and a sector-level (not per-ticker) flow
++    regime whose historical correlation with forward 5-day sector
++    returns is only ~+0.05 (see the Session 8 exploration in
++    docs/BUILD_LOG.md). 10 points keeps each individually smaller
++    than the technical term and jointly unable to dominate it, while
++    still letting fundamentals/flows move a score visibly when they
++    genuinely diverge from neutral.
+ """
+ 
+ import time
++from datetime import date
+ 
+ from loguru import logger
+ 
+@@ -81,6 +133,42 @@ class Arbitrator(BaseAgent):
+     ML_GATE: float = 0.55
+     ML_DIRECTION = {"UP": 1, "DOWN": -1, "FLAT": 0}
+ 
++    # ── Phase 5 Session 8: fundamentals value tilt ──────────────────
++    # Each metric (P/E, dividend yield) is worth up to ±5 points; both
++    # extreme in the same direction give the full ±10. An excluded or
++    # missing metric contributes 0 — deliberately NOT renormalized
++    # over the remaining metrics, so a ticker with less usable
++    # evidence gets a smaller possible swing, not an amplified one.
++    FUND_METRIC_MAGNITUDE: float = 5.0
++    # A metric needs at least this many valid values across the active
++    # universe (including the analyzed ticker) before a percentile
++    # rank means anything at all. With 10 active tickers this is only
++    # a guard against future data erosion, not a live constraint.
++    FUND_MIN_RANKED: int = 4
++
++    # ── Phase 5 Session 8: sector FIPI/LIPI flow regime ─────────────
++    FLOW_MAGNITUDE: float = 10.0
++    # |imbalance ratio| that maps to the full ±10. 0.125 ≈ the 90th
++    # percentile of the 10-day |Σnet/Σgross| ratio over the full
++    # 2021-06 → 2026-07 institutional_flows archive, pooled across the
++    # three mapped sector groups (measured 0.1258 in the Session 8
++    # exploration — see docs/BUILD_LOG.md). A median flow day
++    # (|ratio| ≈ 0.047) therefore lands near ±3.8.
++    FLOW_SCALE: float = 0.125
++    # Fewer flow trading days than this → honest zero (can't call a
++    # "regime" on a couple of days of data).
++    FLOW_MIN_DAYS: int = 5
++    # Staleness gate, MANDATORY: if the newest flow row used is more
++    # than this many calendar days older than report_date, the term is
++    # 0.0 with reason "stale_flow_data". 14 days ≈ tolerance for one
++    # missed manual weekly refresh plus a holiday cluster (the
++    # institutional_flows table is refreshed by hand via the browser
++    # pane — automated collection is Cloudflare-blocked, see
++    # docs/KNOWN_ISSUES.md "Problem B"), while still guaranteeing a
++    # dead pipeline degrades to silence rather than scoring tickers
++    # on month-old flow regimes.
++    FLOW_STALE_DAYS: int = 14
++
+     async def run(self, context: AgentContext) -> AgentResult:
+         start = time.monotonic()
+ 
+@@ -89,7 +177,21 @@ class Arbitrator(BaseAgent):
+         filings = context.filing_flags
+         ml_signal = context.ml_signal or {}
+ 
+-        score = self._calculate_score(trend, news, filings, ml_signal)
++        # Phase 5 Session 8 — the two deterministic terms are computed
++        # ONCE here (each returns (points, detail_dict)) and threaded
++        # through the score, the breakdown, and the narrative prompt,
++        # so the number the user sees, the audit detail, and what the
++        # LLM was told can never drift apart.
++        fund = self._fundamentals_contribution(
++            context.ticker, context.peer_fundamentals or {}
++        )
++        flow = self._flow_contribution(
++            context.sector_flows or {}, context.report_date
++        )
++
++        score = self._calculate_score(
++            trend, news, filings, ml_signal, fund[0], flow[0]
++        )
+         signal_label = self._score_to_label(score)
+ 
+         prompt = self._build_prompt(
+@@ -99,6 +201,8 @@ class Arbitrator(BaseAgent):
+             news,
+             filings,
+             ml_signal,
++            fund,
++            flow,
+             score,
+         )
+ 
+@@ -139,7 +243,7 @@ class Arbitrator(BaseAgent):
+                 "bear_case": parsed["bear_case"],
+                 "risk_factors": parsed["risk_factors"],
+                 "score_breakdown": self._build_score_breakdown(
+-                    trend, news, filings, ml_signal
++                    trend, news, filings, ml_signal, fund, flow
+                 ),
+             },
+             confidence=confidence,
+@@ -153,12 +257,16 @@ class Arbitrator(BaseAgent):
+         news: dict,
+         filings: dict,
+         ml_signal: dict,
++        fundamentals_points: float = 0.0,
++        flow_points: float = 0.0,
+     ) -> float:
+         score = 50.0
+         score += self._technical_contribution(trend)
+         score += self._news_contribution(news)
+         score += self._filing_contribution(filings)
+         score += self._ml_contribution(ml_signal)
++        score += fundamentals_points
++        score += flow_points
+         return max(0.0, min(100.0, score))
+ 
+     def _technical_contribution(self, trend: dict) -> float:
+@@ -193,12 +301,263 @@ class Arbitrator(BaseAgent):
+         )
+         return direction * self.ML_MAGNITUDE
+ 
++    @staticmethod
++    def _percentile_rank(value: float, values: list[float]) -> float:
++        """
++        Average-rank percentile of `value` within `values` (which
++        includes it), in [0, 1]. 0 = lowest, 1 = highest; ties share
++        their average rank. Callers must guarantee len(values) >= 2.
++        """
++        less = sum(1 for v in values if v < value)
++        equal = sum(1 for v in values if v == value)
++        avg_rank = less + (equal + 1) / 2.0  # 1-based average rank
++        return (avg_rank - 1.0) / (len(values) - 1.0)
++
++    def _fundamentals_contribution(
++        self, ticker: str, peer_fundamentals: dict
++    ) -> tuple[float, dict]:
++        """
++        Deterministic value tilt vs the active peer universe.
++
++        EXACT FORMULA (also stated in the module docstring and
++        docs/BUILD_LOG.md so it is auditable outside this file):
++
++            tilt_pe    = (0.5 − pct_rank(P/E among valid peers)) × 2
++            tilt_yield = (pct_rank(yield among valid peers) − 0.5) × 2
++            contribution = clamp(5·tilt_pe + 5·tilt_yield, −10, +10)
++
++        where pct_rank is the average-rank percentile in [0, 1], so a
++        cheaper-than-peers P/E and a higher-than-peers dividend yield
++        both tilt positive, each metric is worth up to ±5, and an
++        excluded metric contributes exactly 0 (no renormalization —
++        less evidence means a smaller possible swing).
++
++        Data-validity rules (known-bad data is EXCLUDED, not used):
++          - P/E: valid iff present and > 0.
++          - dividend_yield: valid iff present and > 0.0. PSX Terminal
++            serves a literal 0.0 when it has no dividend data — LUCK
++            and MARI both pay dividends yet are served 0.0 (documented
++            in docs/KNOWN_ISSUES.md) — so an exact 0.0 from this
++            source means "no data", never "true zero yield". The rule
++            is source-behavioral, not a ticker hardcode.
++
++        Every exclusion is recorded per metric in the returned detail
++        dict, which is persisted in the score breakdown — the same
++        "distinguish real zero from no/bad data" discipline as the
++        filing term.
++
++        CAVEAT (by construction): this is a peer ranking over a
++        ~10-ticker universe — statistically weak, a relative tilt
++        within this small universe, not a valuation model. Flagged in
++        the persisted detail so no consumer can mistake it for more.
++        """
++        detail: dict = {
++            "used": False,
++            "skip_reason": None,
++            "metrics": {},
++            "combined_points": 0.0,
++            "metric_magnitude_points": self.FUND_METRIC_MAGNITUDE,
++            "peer_universe_size": len(peer_fundamentals),
++            "caveat": (
++                "Peer-percentile ranking over a ~10-ticker universe — "
++                "statistically weak by construction; a relative tilt "
++                "within this small universe, not a valuation model."
++            ),
++        }
++
++        own = peer_fundamentals.get(ticker)
++        if not own:
++            detail["skip_reason"] = "no_fundamentals_row"
++            return 0.0, detail
++
++        def valid_pe(v: object) -> bool:
++            return isinstance(v, (int, float)) and v > 0
++
++        def valid_yield(v: object) -> bool:
++            # exact 0.0 excluded: PSX Terminal serves literal 0.0 for
++            # "no dividend data" (documented for LUCK/MARI).
++            return isinstance(v, (int, float)) and v > 0.0
++
++        specs = [
++            # (metric key, validity fn, higher_is_better, excluded-reason)
++            ("pe_ratio", valid_pe, False,
++             "missing_or_nonpositive_at_source"),
++            ("dividend_yield", valid_yield, True,
++             "missing_or_zero_at_source (PSX Terminal serves literal "
++             "0.0 when it has no dividend data — documented for "
++             "LUCK/MARI in KNOWN_ISSUES)"),
++        ]
++
++        total_points = 0.0
++        any_used = False
++        for key, is_valid, higher_better, bad_reason in specs:
++            values = [
++                f[key] for f in peer_fundamentals.values()
++                if is_valid(f.get(key))
++            ]
++            own_value = own.get(key)
++            metric: dict = {
++                "used": False,
++                "value": own_value,
++                "n_ranked": len(values),
++                "percentile": None,
++                "tilt": None,
++                "reason": None,
++            }
++            if not is_valid(own_value):
++                metric["reason"] = bad_reason
++            elif len(values) < self.FUND_MIN_RANKED:
++                metric["reason"] = (
++                    f"insufficient_peers (need >= "
++                    f"{self.FUND_MIN_RANKED} valid values, have "
++                    f"{len(values)})"
++                )
++            else:
++                pct = self._percentile_rank(own_value, values)
++                tilt = (
++                    (pct - 0.5) * 2 if higher_better else (0.5 - pct) * 2
++                )
++                metric.update(
++                    used=True,
++                    percentile=round(pct, 4),
++                    tilt=round(tilt, 4),
++                )
++                total_points += tilt * self.FUND_METRIC_MAGNITUDE
++                any_used = True
++            detail["metrics"][key] = metric
++
++        if not any_used:
++            detail["skip_reason"] = "no_usable_metrics"
++            return 0.0, detail
++
++        contribution = max(-10.0, min(10.0, total_points))
++        detail["used"] = True
++        detail["combined_points"] = round(contribution, 2)
++        return contribution, detail
++
++    def _flow_contribution(
++        self, sector_flows: dict, report_date: date
++    ) -> tuple[float, dict]:
++        """
++        Deterministic sector-level FIPI/LIPI institutional-flow regime
++        term.
++
++        EXACT FORMULA (also stated in the module docstring and
++        docs/BUILD_LOG.md):
++
++            ratio = Σ net_value / Σ gross_value over the last ≤10 flow
++                    trading days for the ticker's mapped NCCPL
++                    sector(s)
++            contribution = clamp(ratio / 0.125, −1, +1) × 10
++
++        net/gross come pre-aggregated from the orchestrator's variant:
++        FIPI + local-institutional LIPI (all non-retail client types),
++        REG market, sector-wise datasets. gross = buy + |sell|, so the
++        ratio is a flow-imbalance fraction in [−1, 1]. FLOW_SCALE
++        0.125 ≈ the historical p90 of |ratio| (see constant comment).
++
++        HONEST-ZERO paths, each with a distinct machine-readable
++        reason persisted in the detail dict (a real near-zero flow
++        reading must never look the same as "we didn't use this"):
++          - no_flow_context            legacy caller, context absent
++          - sector_not_covered_by_nccpl  e.g. ENGROH's "Investment
++            Companies" has no named NCCPL sector; the "All other
++            Sectors" catch-all is deliberately NOT used as a proxy
++          - insufficient_flow_history  fewer than FLOW_MIN_DAYS days
++          - stale_flow_data            MANDATORY staleness gate: the
++            newest flow row used is > FLOW_STALE_DAYS (14) calendar
++            days older than report_date. Threshold reasoning: the
++            table is refreshed manually (~weekly); 14 days absorbs
++            one missed refresh + holidays but silences a dead feed.
++          - zero_gross_turnover        degenerate denominator
++        """
++        detail: dict = {
++            "used": False,
++            "skip_reason": None,
++            "sector": sector_flows.get("sector"),
++            "nccpl_sectors": sector_flows.get("nccpl_sectors"),
++            "variant": sector_flows.get("variant"),
++            "latest_flow_date": sector_flows.get("latest_flow_date"),
++            "window_days": None,
++            "window_start": None,
++            "window_end": None,
++            "net_value_pkr": None,
++            "gross_value_pkr": None,
++            "imbalance_ratio": None,
++            "scale": self.FLOW_SCALE,
++            "magnitude_points": self.FLOW_MAGNITUDE,
++            "staleness_days": None,
++            "stale_threshold_days": self.FLOW_STALE_DAYS,
++        }
++
++        if not sector_flows:
++            detail["skip_reason"] = "no_flow_context"
++            return 0.0, detail
++
++        if not sector_flows.get("nccpl_sectors"):
++            detail["skip_reason"] = "sector_not_covered_by_nccpl"
++            return 0.0, detail
++
++        daily = sector_flows.get("daily") or []
++        if len(daily) < self.FLOW_MIN_DAYS:
++            detail["skip_reason"] = (
++                f"insufficient_flow_history (have {len(daily)} days, "
++                f"need >= {self.FLOW_MIN_DAYS})"
++            )
++            return 0.0, detail
++
++        window_end = max(d["date"] for d in daily)
++        window_start = min(d["date"] for d in daily)
++        staleness_days = (
++            report_date - date.fromisoformat(window_end)
++        ).days
++        detail.update(
++            window_days=len(daily),
++            window_start=window_start,
++            window_end=window_end,
++            staleness_days=staleness_days,
++        )
++
++        if staleness_days > self.FLOW_STALE_DAYS:
++            detail["skip_reason"] = (
++                f"stale_flow_data (newest flow row {window_end} is "
++                f"{staleness_days} days before report_date "
++                f"{report_date}; threshold {self.FLOW_STALE_DAYS})"
++            )
++            logger.warning(
++                f"flow_contribution: stale data, not used — newest "
++                f"row {window_end}, {staleness_days}d old "
++                f"(threshold {self.FLOW_STALE_DAYS}d)"
++            )
++            return 0.0, detail
++
++        net = sum(d["net_value"] for d in daily)
++        gross = sum(d["gross_value"] for d in daily)
++        detail.update(
++            net_value_pkr=round(net, 2),
++            gross_value_pkr=round(gross, 2),
++        )
++        if gross <= 0:
++            detail["skip_reason"] = "zero_gross_turnover"
++            return 0.0, detail
++
++        ratio = net / gross
++        scaled = max(-1.0, min(1.0, ratio / self.FLOW_SCALE))
++        contribution = scaled * self.FLOW_MAGNITUDE
++        detail.update(
++            used=True,
++            imbalance_ratio=round(ratio, 4),
++        )
++        return contribution, detail
++
+     def _build_score_breakdown(
+         self,
+         trend: dict,
+         news: dict,
+         filings: dict,
+         ml_signal: dict,
++        fund: tuple[float, dict],
++        flow: tuple[float, dict],
+     ) -> dict:
+         """
+         Score-breakdown dict persisted on the IntelligenceReport.
+@@ -217,6 +576,15 @@ class Arbitrator(BaseAgent):
+                 self._filing_contribution(filings), 2
+             ),
+             "ml_contribution": round(self._ml_contribution(ml_signal), 2),
++            # Phase 5 Session 8 — deterministic tilts, computed once
++            # in run() and passed in as (points, detail) tuples. The
++            # detail blocks are always present (even at 0.0) so a
++            # consumer can tell a real neutral reading from an
++            # excluded/stale/unmapped honest zero.
++            "fundamentals_contribution": round(fund[0], 2),
++            "flow_contribution": round(flow[0], 2),
++            "fundamentals_detail": fund[1],
++            "flow_detail": flow[1],
+         }
+ 
+         # ML detail block — always present, even when 0, so consumers
+@@ -255,6 +623,8 @@ class Arbitrator(BaseAgent):
+         news: dict,
+         filings: dict,
+         ml_signal: dict,
++        fund: tuple[float, dict],
++        flow: tuple[float, dict],
+         score: float,
+     ) -> str:
+         tech_signal = trend.get("signal", "NEUTRAL")
+@@ -278,6 +648,7 @@ class Arbitrator(BaseAgent):
+         )
+ 
+         ml_block = self._render_ml_block(ml_signal)
++        tilts_block = self._render_tilts_block(fund, flow)
+ 
+         return (
+             f"You are the Chief Investment Strategist synthesizing "
+@@ -295,6 +666,7 @@ class Arbitrator(BaseAgent):
+             f"Red Flags: {red_flags_str}\n"
+             f"{filing_analysis}\n\n"
+             f"{ml_block}\n"
++            f"{tilts_block}\n"
+             f"CALCULATED CONVICTION SCORE: {score:.1f}/100\n\n"
+             f"Write a balanced investment brief:\n"
+             f"1. BULL_CASE: 2-3 sentences on why this could be a good "
+@@ -361,6 +733,67 @@ class Arbitrator(BaseAgent):
+             f"As of trading day: {as_of}\n"
+         )
+ 
++    def _render_tilts_block(
++        self, fund: tuple[float, dict], flow: tuple[float, dict]
++    ) -> str:
++        """
++        Render the two deterministic Session 8 tilts for the narrative
++        prompt. Always emitted (consistent prompt shape), always
++        honest: when a term is an honest zero the LLM is told the
++        machine-readable reason rather than being left to invent one.
++        These are already inside the calculated score — the LLM
++        interprets them, it does not re-apply them.
++        """
++        fund_points, fund_detail = fund
++        flow_points, flow_detail = flow
++
++        if fund_detail.get("used"):
++            metrics = fund_detail.get("metrics", {})
++            parts = []
++            for key, label in (
++                ("pe_ratio", "P/E"),
++                ("dividend_yield", "dividend yield"),
++            ):
++                m = metrics.get(key, {})
++                if m.get("used"):
++                    parts.append(
++                        f"{label} percentile {m['percentile']:.2f} "
++                        f"vs peers"
++                    )
++                else:
++                    parts.append(f"{label} excluded (bad/missing data)")
++            fund_line = (
++                f"{fund_points:+.1f} points ({'; '.join(parts)}; "
++                f"small ~10-ticker peer universe — weak evidence)"
++            )
++        else:
++            fund_line = (
++                f"0.0 points (not used: "
++                f"{fund_detail.get('skip_reason')})"
++            )
++
++        if flow_detail.get("used"):
++            flow_line = (
++                f"{flow_points:+.1f} points (sector "
++                f"{flow_detail.get('nccpl_sectors')}, "
++                f"{flow_detail.get('window_days')}-day foreign + "
++                f"local-institutional net/gross imbalance "
++                f"{flow_detail.get('imbalance_ratio'):+.3f}, data "
++                f"through {flow_detail.get('window_end')})"
++            )
++        else:
++            flow_line = (
++                f"0.0 points (not used: "
++                f"{flow_detail.get('skip_reason')})"
++            )
++
++        return (
++            "DETERMINISTIC SCORE TILTS (already included in the "
++            "calculated score below — interpret, do not re-apply):\n"
++            f"Fundamentals value tilt vs peer universe: {fund_line}\n"
++            f"Sector institutional-flow regime: {flow_line}\n"
++        )
++
+     def _parse_response(self, content: str) -> dict:
+         result: dict = {
+             "bull_case": (
+```

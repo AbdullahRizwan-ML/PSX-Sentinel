@@ -219,6 +219,11 @@ these are smoothed over in the DB (missing = NULL, absent = no row):
   companies pay dividends, so treat a 0.0 yield from this source as
   "probably no data" rather than a true zero. Stored as-is (0.0) because
   that is what the source returned — flagging here instead of guessing.
+  **Mitigation live (Phase 5 Session 8):** the Arbitrator's fundamentals
+  tilt treats an exact-0.0 dividend yield as missing (excluded from that
+  ticker's ranking, exclusion + reason logged per metric in the persisted
+  `fundamentals_detail`) — the suspect values are still stored as-is, but
+  they can no longer leak into a conviction score as if they were real.
 - **pdf_url coverage varies:** UBL 3/10, HBL 7/9, LUCK 9/10, OGDC 9/10
   (the rest 10/10). Missing ones are mostly "Disclosure of Interest"
   notices that carry only an image attachment, no PDF.
@@ -314,6 +319,17 @@ re-pass the challenge, resume only the months not yet on disk/in the DB).
 Dedup re-proven (full reload of every chunk inserted +0). This is still
 a **manual bootstrap, not automation.**
 
+**New stake in Problem B (Phase 5 Session 8, 2026-07-18):** the
+conviction score's `flow_contribution` term now reads
+`institutional_flows` at analysis time, so flow freshness has a
+user-visible consequence for the first time. The term is
+staleness-gated: if the newest flow row used is more than 14 calendar
+days older than the report date it contributes 0.0 with a logged
+`stale_flow_data` reason (visible in the report's `flow_detail`) —
+an honest degradation, not silent use of old data. Practically: keep
+refreshing FIPI/LIPI at least every ~2 weeks via the browser-pane
+channel until Problem B is solved, or the flow term goes quiet.
+
 **⚠️ Problem B — ongoing UNATTENDED collection — remains UNSOLVED and is
 separate from the Session 5 backfill above.** Session 5 deepened the
 *historical* archive by hand; it did **not** make daily collection run
@@ -400,6 +416,23 @@ this now so a clustered 58.5-ish score across many tickers isn't
 mistaken for a future regression — it's the expected output of the
 current formula with two of its four terms still structurally pinned
 to zero (filing always, ML almost always).
+
+**Update (Phase 5 Session 8, 2026-07-18): largely eased.** Two new
+always-computable deterministic terms — the fundamentals value tilt
+(±10) and the sector FIPI/LIPI flow regime (±10) — now vary per ticker
+on data that exists for (nearly) the whole universe, so identical
+scores across tickers with different data are no longer the norm. The
+six Session 8 verification runs spread 25.8 → 53.9 (PPL 30.6, MCB
+53.7, LUCK 49.6, MARI 35.8, ENGROH 53.9, PSO 25.8) where five of the
+six had sat at exactly 50.0/35.0. Caveats that keep this honest: the
+tilt is a ~10-ticker peer rank (statistically weak by construction),
+the flow term is sector-level (all O&G tickers share one flow reading)
+and a regime descriptor, not a return predictor (historical correlation
+with forward 5-day sector returns only ~+0.05), and both terms emit
+honest zeros with logged reasons rather than fabricating signal
+(ENGROH's sector is unmapped at NCCPL; stale flow data is refused
+after 14 days). The ML term still contributes 0 in production (gate
+unchanged), and news still reads 0 for most tickers.
 
 ### ENGRO stopped trading in Jan 2025 (ENGRO → ENGROH corporate action)
 

@@ -21,7 +21,7 @@ import uuid
 from datetime import date, datetime, timedelta
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.arbitrator import Arbitrator
@@ -34,6 +34,7 @@ from app.core.redis_client import redis_client
 from app.db.models import (
     Announcement,
     Company,
+    CompanyFundamentals,
     DailyPrice,
     IntelligenceReport,
     NewsArticle,
@@ -47,6 +48,92 @@ from app.ml.inference import predict_from_prices
 # of data above the binding constraint), which also lets TrendAnalyzer
 # work from a richer-than-before history. Pre-Session-3 this was 365.
 PRICE_WINDOW_DAYS = 600
+
+# ── Phase 5 Session 8: sector-flow context (FIPI/LIPI regime term) ──
+#
+# companies.sector label → NCCPL sector-wise sector_name list. NCCPL's
+# finest granularity is sector level (never per-ticker) and its
+# vocabulary differs from ours:
+#   - Our coarse "Oil & Gas" bucket spans BOTH NCCPL O&G sectors
+#     (OGDC/PPL/MARI are Exploration, PSO is Marketing — our sector
+#     label can't tell them apart, so both NCCPL sectors are summed;
+#     a documented granularity loss, not a bug).
+#   - "Investment Companies" (ENGROH) has NO named NCCPL sector — it
+#     falls inside NCCPL's "All other Sectors" catch-all, which mixes
+#     dozens of unrelated sectors. Mapping it there would fabricate a
+#     signal, so it is deliberately UNMAPPED → the Arbitrator emits an
+#     honest-zero flow term with reason "sector_not_covered_by_nccpl".
+NCCPL_SECTOR_MAP: dict[str, list[str]] = {
+    "Banking": ["Commercial Banks"],
+    "Cement": ["Cement"],
+    "Oil & Gas": [
+        "Oil and Gas Exploration Companies",
+        "Oil and Gas Marketing Companies",
+    ],
+}
+
+# Trading-day lookback for the flow window (chosen over 5 in the
+# Session 8 exploration: lag-1 autocorrelation 0.94 vs 0.86, sign-flip
+# rate ~9% vs ~16% — more regime-like, which is what this term claims
+# to measure). The Arbitrator enforces its own minimum-days and
+# staleness gates on whatever this fetch returns.
+FLOW_LOOKBACK_DAYS = 10
+
+# LIPI client types EXCLUDED from the flow variant. The chosen variant
+# is "foreign + local institutional" (FIPI net + LIPI net over every
+# non-retail client type), because FIPI + LIPI over ALL client types
+# is structurally zero — every foreign net buy is a local net sell by
+# accounting identity (verified live on real rows, Session 8) — and
+# FIPI-only anti-correlated with forward sector returns for O&G in the
+# 2021-2026 exploration while correlating positively for Banks, i.e.
+# its sign meaning was sector-inconsistent. Full comparison table in
+# docs/BUILD_LOG.md (Session 8).
+LIPI_RETAIL_TYPES = ["INDIVIDUALS", "BROKER PROPRIETARY TRADING"]
+
+FLOW_VARIANT = (
+    "fipi_plus_local_institutional (REG market, sector-wise datasets; "
+    "LIPI minus INDIVIDUALS/BROKER PROPRIETARY TRADING)"
+)
+
+# One row per flow trading day for the mapped sectors: net and gross
+# (buy + |sell|; sells are stored negative, hence buy - sell) PKR
+# turnover of the chosen variant. REGULAR is the pre-2025-05 spelling
+# of REG in the FIPI archive rows — both are the cash equities market.
+_SECTOR_FLOW_SQL = (
+    text(
+        """
+        SELECT date,
+               SUM(CASE
+                     WHEN dataset = 'fipi_sector_wise'
+                       THEN COALESCE(net_value, 0)
+                     WHEN dataset = 'lipi_sector_wise'
+                          AND client_type NOT IN :retail
+                       THEN COALESCE(net_value, 0)
+                     ELSE 0
+                   END) AS net_value,
+               SUM(CASE
+                     WHEN dataset = 'fipi_sector_wise'
+                       THEN COALESCE(buy_value, 0) - COALESCE(sell_value, 0)
+                     WHEN dataset = 'lipi_sector_wise'
+                          AND client_type NOT IN :retail
+                       THEN COALESCE(buy_value, 0) - COALESCE(sell_value, 0)
+                     ELSE 0
+                   END) AS gross_value
+        FROM institutional_flows
+        WHERE dataset IN ('fipi_sector_wise', 'lipi_sector_wise')
+          AND market_type IN ('REG', 'REGULAR')
+          AND sector_name IN :sectors
+          AND date <= :report_date
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT :lookback
+        """
+    )
+    .bindparams(
+        bindparam("retail", expanding=True),
+        bindparam("sectors", expanding=True),
+    )
+)
 
 
 class AnalysisOrchestrator:
@@ -80,7 +167,7 @@ class AnalysisOrchestrator:
         await self.db.flush()
 
         context = await self._build_context(
-            ticker, company.name, str(report_id)
+            ticker, company.name, company.sector, str(report_id)
         )
 
         # Compute the point-in-time ML price-direction signal
@@ -106,7 +193,11 @@ class AnalysisOrchestrator:
             f"ml_signal=available={context.ml_signal.get('available')} "
             f"gate={context.ml_signal.get('gate_passed')} "
             f"class={context.ml_signal.get('predicted_class')} "
-            f"p={context.ml_signal.get('max_prob')}"
+            f"p={context.ml_signal.get('max_prob')}, "
+            f"fundamentals_peers={len(context.peer_fundamentals)}, "
+            f"flow_days={len(context.sector_flows.get('daily') or [])} "
+            f"(sector='{context.sector_flows.get('sector')}' -> "
+            f"{context.sector_flows.get('nccpl_sectors')})"
         )
 
         trend_result = await trend_agent.run_safe(context)
@@ -153,6 +244,16 @@ class AnalysisOrchestrator:
             "bear_case", "Analysis incomplete."
         )
         report.risk_factors = arb_output.get("risk_factors", [])
+        # Phase 5 Session 8: the two deterministic terms also land in
+        # first-class nullable columns for direct-SQL auditability.
+        # dict.get() keeps them None (not 0.0) when the Arbitrator
+        # failed outright and produced no breakdown — None means "not
+        # computed", 0.0 means "computed, contributed nothing".
+        breakdown = arb_output.get("score_breakdown") or {}
+        report.fundamentals_contribution = breakdown.get(
+            "fundamentals_contribution"
+        )
+        report.flow_contribution = breakdown.get("flow_contribution")
         report.agent_outputs = {
             r.agent_name: {
                 "output": r.output,
@@ -201,7 +302,11 @@ class AnalysisOrchestrator:
         return company
 
     async def _build_context(
-        self, ticker: str, company_name: str, analysis_id: str
+        self,
+        ticker: str,
+        company_name: str,
+        sector: str,
+        analysis_id: str,
     ) -> AgentContext:
         cutoff_price = date.today() - timedelta(days=PRICE_WINDOW_DAYS)
         price_result = await self.db.execute(
@@ -275,6 +380,11 @@ class AnalysisOrchestrator:
             for a in announcements_db
         ]
 
+        peer_fundamentals = await self._build_peer_fundamentals()
+        sector_flows = await self._build_sector_flows(
+            sector, date.today()
+        )
+
         return AgentContext(
             ticker=ticker,
             company_name=company_name,
@@ -283,4 +393,103 @@ class AnalysisOrchestrator:
             recent_prices=recent_prices,
             news_articles=news_articles,
             announcements=announcements,
+            peer_fundamentals=peer_fundamentals,
+            sector_flows=sector_flows,
         )
+
+    async def _build_peer_fundamentals(self) -> dict:
+        """
+        Latest fundamentals snapshot for every ACTIVE (non-delisted)
+        company that has a company_fundamentals row, keyed by ticker.
+
+        Only the two metrics the Arbitrator's fundamentals tilt ranks
+        on are carried (pe_ratio, dividend_yield). Values are passed
+        through EXACTLY as stored — including PSX Terminal's
+        literal-0.0 dividend yields (documented suspect for LUCK/MARI)
+        and NULLs — because deciding what counts as usable data is the
+        Arbitrator's job, where the exclusion is logged per ticker in
+        the persisted score breakdown.
+        """
+        result = await self.db.execute(
+            select(
+                CompanyFundamentals.ticker,
+                CompanyFundamentals.pe_ratio,
+                CompanyFundamentals.dividend_yield,
+            )
+            .join(Company, CompanyFundamentals.ticker == Company.ticker)
+            .where(Company.delisted_date.is_(None))
+        )
+        return {
+            row.ticker: {
+                "pe_ratio": row.pe_ratio,
+                "dividend_yield": row.dividend_yield,
+            }
+            for row in result.all()
+        }
+
+    async def _build_sector_flows(
+        self, sector: str, report_date: date
+    ) -> dict:
+        """
+        Sector-level NCCPL FIPI/LIPI daily aggregates for the ticker's
+        mapped sector(s), for the Arbitrator's flow-regime term.
+
+        Shape:
+            {
+              "sector":           companies.sector label,
+              "nccpl_sectors":    mapped NCCPL sector_name list
+                                  ([] when the sector is unmapped —
+                                  the Arbitrator turns that into an
+                                  honest zero with a logged reason),
+              "variant":          human-readable variant definition,
+              "latest_flow_date": global MAX(date) in
+                                  institutional_flows (None when the
+                                  table is empty) — how fresh our flow
+                                  archive is at all,
+              "daily":            up to FLOW_LOOKBACK_DAYS most recent
+                                  flow trading days (ascending), each
+                                  {"date", "net_value", "gross_value"}
+                                  in PKR for the chosen variant.
+            }
+
+        The staleness gate itself lives in the Arbitrator (it is a
+        scoring-policy decision and must be visible in the score
+        breakdown) — this method only reports the dates honestly.
+        """
+        mapped = NCCPL_SECTOR_MAP.get(sector, [])
+
+        latest_row = await self.db.execute(
+            text("SELECT MAX(date) AS d FROM institutional_flows")
+        )
+        latest_flow_date = latest_row.scalar_one_or_none()
+
+        daily: list[dict] = []
+        if mapped:
+            rows = await self.db.execute(
+                _SECTOR_FLOW_SQL,
+                {
+                    "retail": LIPI_RETAIL_TYPES,
+                    "sectors": mapped,
+                    "report_date": report_date,
+                    "lookback": FLOW_LOOKBACK_DAYS,
+                },
+            )
+            daily = [
+                {
+                    "date": str(r.date),
+                    "net_value": float(r.net_value or 0.0),
+                    "gross_value": float(r.gross_value or 0.0),
+                }
+                for r in rows.all()
+            ]
+            daily.reverse()  # fetched DESC for the LIMIT; serve ascending
+
+        return {
+            "sector": sector,
+            "nccpl_sectors": mapped,
+            "variant": FLOW_VARIANT,
+            "latest_flow_date": (
+                str(latest_flow_date) if latest_flow_date else None
+            ),
+            "daily": daily,
+        }

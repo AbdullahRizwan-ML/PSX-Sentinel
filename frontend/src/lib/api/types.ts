@@ -101,8 +101,66 @@ export interface MlDetail {
 }
 
 /*
+ * One metric's peer-rank record inside FundamentalsDetail. Mirrors
+ * backend FundMetricRank (Phase 5 Session 8). used=false + reason
+ * documents why a metric was excluded (e.g. PSX Terminal's literal-0.0
+ * dividend yields for LUCK/MARI).
+ */
+export interface FundMetricRank {
+  used: boolean;
+  value: number | null;
+  n_ranked: number | null;
+  percentile: number | null;
+  tilt: number | null;
+  reason: string | null;
+}
+
+/*
+ * Audit detail for the fundamentals value tilt. Mirrors backend
+ * FundamentalsDetail (Phase 5 Session 8).
+ */
+export interface FundamentalsDetail {
+  used: boolean;
+  skip_reason: string | null;
+  metrics: { pe_ratio?: FundMetricRank; dividend_yield?: FundMetricRank } | null;
+  combined_points: number | null;
+  metric_magnitude_points: number | null;
+  peer_universe_size: number | null;
+  caveat: string | null;
+}
+
+/*
+ * Audit detail for the sector FIPI/LIPI flow regime term. Mirrors
+ * backend FlowDetail (Phase 5 Session 8). skip_reason distinguishes
+ * the honest-zero paths (stale data / unmapped sector / not enough
+ * days) from a genuine near-zero flow reading.
+ */
+export interface FlowDetail {
+  used: boolean;
+  skip_reason: string | null;
+  sector: string | null;
+  nccpl_sectors: string[] | null;
+  variant: string | null;
+  latest_flow_date: string | null;
+  window_days: number | null;
+  window_start: string | null;
+  window_end: string | null;
+  net_value_pkr: number | null;
+  gross_value_pkr: number | null;
+  imbalance_ratio: number | null;
+  scale: number | null;
+  magnitude_points: number | null;
+  staleness_days: number | null;
+  stale_threshold_days: number | null;
+}
+
+/*
  * Per-term contributions that (plus a base of 50) sum to the final
  * conviction_score. Mirrors backend ScoreBreakdown.
+ *
+ * The fundamentals/flow terms (Phase 5 Session 8) are optional:
+ * null/undefined on any report generated before that session — the
+ * breakdown strip omits those pills entirely rather than faking a 0.
  */
 export interface ScoreBreakdown {
   technical_contribution: number;
@@ -110,6 +168,10 @@ export interface ScoreBreakdown {
   filing_contribution: number;
   ml_contribution: number;
   ml_detail: MlDetail | null;
+  fundamentals_contribution?: number | null;
+  flow_contribution?: number | null;
+  fundamentals_detail?: FundamentalsDetail | null;
+  flow_detail?: FlowDetail | null;
 }
 
 /*

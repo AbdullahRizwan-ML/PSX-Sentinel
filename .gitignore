@@ -35,3 +35,9 @@ Thumbs.db
 .claude/
 # Downloaded announcement PDFs (PDFParser working files; DB raw_text is the deliverable)
 backend/data/announcements/
+
+# Verification-run snapshots (scripts/verify_*.py --save artifacts; the
+# Build Log carries the numbers, the DB carries the reports)
+backend/baseline.json
+backend/after.json
+backend/s8_*.json
