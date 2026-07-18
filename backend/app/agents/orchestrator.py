@@ -265,6 +265,12 @@ class AnalysisOrchestrator:
                 "raw_text": a.raw_text or "",
                 "fiscal_quarter": a.fiscal_quarter,
                 "fiscal_year": a.fiscal_year,
+                # Phase 5 Session 7: FilingSceptic needs to distinguish
+                # "PDF text extracted" from "image-only/absent PDF"
+                # (title-only fallback) and to cite the source document.
+                "pdf_url": a.pdf_url,
+                "pdf_parsed": bool(a.pdf_parsed),
+                "source": a.source,
             }
             for a in announcements_db
         ]

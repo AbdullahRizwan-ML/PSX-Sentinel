@@ -43,6 +43,22 @@ no longer empty. The mirror serves only the latest ~10 announcements per
 ticker — it is a rolling window, not a historical archive, so PUCARS-direct
 scraping remains the eventual plan for depth.
 
+**Update (Phase 5 Session 7, 2026-07-18): FilingSceptic is no longer
+starved.** `PDFParser` was broadened to all announcement categories and
+run against the mirror's PDFs: 83/94 rows parsed (11 have no pdf_url),
+**51 with extracted text** in `raw_text`. FilingSceptic now reviews the
+recent batch per ticker (full text where extractable, title-only
+fallback otherwise) and produced its first-ever real penalty (PSO −15,
+board-resignation + CEO-change cluster). Remaining gaps, still real:
+**~39% of the PDFs are image-only scans with no text layer** (no OCR is
+attempted — title-only mode, logged per announcement in the agent
+output), and the mirror is still a ~10-per-ticker rolling window —
+PUCARS-direct scraping remains the eventual plan for depth. Note also a
+pipeline-ordering quirk: PDF parsing is step 4 but the mirror that
+creates announcement rows is step 6, so announcements mirrored tonight
+get their PDFs parsed on the NEXT nightly run (deliberate one-run lag,
+kept to avoid reordering the long-verified stage sequence).
+
 ### News-to-ticker matching is noisy
 
 Keyword matching (ticker symbol or first word of company name appearing in 
@@ -331,9 +347,18 @@ consistently nonzero, because:
   above) and an outright skip when there are zero articles to analyze. The
   formula can't currently distinguish "real neutral signal" from "no signal
   at all."
-- `filing_contribution` is always 0.0 right now, since `FilingSceptic` always
-  skips its LLM call until PUCARS scraping (see Announcement scraping issue
-  above) produces real filing text for any ticker.
+- ~~`filing_contribution` is always 0.0 right now, since `FilingSceptic`
+  always skips its LLM call until PUCARS scraping (see Announcement
+  scraping issue above) produces real filing text for any ticker.~~
+  **No longer structurally true (Phase 5 Session 7, 2026-07-18):**
+  FilingSceptic now analyzes real mirrored announcements (extracted PDF
+  text + title-only fallback) and can emit the −5/−15/−30 penalty — PSO
+  scored `filing_contribution=-15` (conviction 50→35) on a real
+  board-resignation + CEO-change cluster in its filings. A 0.0 filing
+  term now usually means "reviewed, nothing to flag" (a real LLM
+  judgment, visible via `filings_reviewed`/tokens in the agent output)
+  rather than "no data"; the old no-data zero still occurs only for a
+  ticker with no announcement rows at all.
 - `ml_contribution` is wired (Phase 3 Session 3, 2026-06-27) but
   currently always 0.0 in production because no ticker's max
   `predict_proba` clears the 0.55 confidence gate. The Session 2

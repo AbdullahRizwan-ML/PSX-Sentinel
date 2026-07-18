@@ -11,7 +11,12 @@ Execution sequence:
 1. Seed companies (idempotent — skips existing)
 2. Collect prices (PriceCollector via PSX DPS)
 3. Collect announcements (AnnouncementCollector via PSX portal)
-4. Parse PDFs (PDFParser for quarterly result documents)
+4. Parse PDFs (PDFParser — all announcement categories since Phase 5
+   Session 7; text-layer PDFs land in raw_text, image-only PDFs leave
+   it NULL. Note: runs BEFORE step 6's PSX Terminal mirror, so
+   announcements mirrored tonight get their PDFs parsed on the NEXT
+   run — a deliberate one-run lag kept to avoid reordering the
+   long-verified stage sequence)
 5. Collect news (NewsCollector via RSS feeds)
 6. Collect fundamentals + announcement mirror (FundamentalsCollector
    via PSX Terminal)

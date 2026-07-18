@@ -1,16 +1,30 @@
 """
 PSX Sentinel — PDF Parser
 
-Downloads and parses PSX quarterly result PDFs from corporate
-announcements. Uses pdfplumber for text extraction and regex
-patterns for fiscal quarter/year identification.
+Downloads and parses PSX announcement PDFs. Uses pdfplumber for text
+extraction and regex patterns for fiscal quarter/year identification.
 
-Only processes QUARTERLY_RESULT announcements that have:
+Processes ALL announcement categories (broadened in Phase 5 Session 7 —
+originally QUARTERLY_RESULT only) that have:
 - A valid pdf_url
 - pdf_parsed = False (not yet attempted)
 
+Why all categories: the risk-relevant substance FilingSceptic needs
+(CEO/board changes, resignations, buy-backs, EOGM resolutions,
+clarifications of media reports) lives mostly under MATERIAL_INFO /
+OTHER, and the mirror's category mapping is keyword-based and imperfect
+anyway (e.g. "Board Meeting for Agenda Other than Financial Results"
+maps to QUARTERLY_RESULT via the "financial results" keyword).
+
+Reality check from the live corpus (2026-07-18, 83 PDFs swept): ~61%
+have an extractable text layer; the other ~39% are image-only scans
+(mostly "Disclosure of Interest" notices). Image-only PDFs yield empty
+text from pdfplumber — those rows keep raw_text NULL and downstream
+consumers (FilingSceptic) fall back to title-only analysis. No OCR is
+attempted, per the no-invented-data rule.
+
 Once processed, pdf_parsed is set to True regardless of success
-to prevent infinite retry loops on corrupt/unparseable PDFs.
+to prevent infinite retry loops on corrupt/unparseable/image-only PDFs.
 """
 
 import io
@@ -40,7 +54,21 @@ class PDFParser(BaseCollector):
     name = "pdf_parser"
 
     PDF_DIR = "data/announcements"
-    MAX_PDFS_PER_RUN = 20  # Prevent runaway processing
+    # The PSX Terminal mirror caps at ~10 announcements/ticker, so the
+    # pending backlog is bounded at ~110 rows for the 11-company table.
+    # 100/run drains a full backlog in one nightly pass while still
+    # capping a pathological queue. (Was 20 when only QUARTERLY_RESULT
+    # rows were eligible.)
+    MAX_PDFS_PER_RUN = 100
+    # Commit progress every N announcements. A full backlog takes
+    # minutes of downloads (2s politeness sleep per PDF); a single
+    # end-of-run commit leaves the Neon connection idle that whole time
+    # and its proxy kills it (seen live 2026-07-18: InterfaceError
+    # "connection is closed" at the final commit — the entire run's
+    # raw_text was rolled back). Batched commits keep the connection
+    # warm and make progress durable, so a mid-run failure costs at
+    # most the current batch.
+    COMMIT_EVERY = 10
     MAX_PAGES = 10  # Only parse first 10 pages per PDF
     MAX_TEXT_LENGTH = 50_000  # Cap stored text at 50K chars
 
@@ -58,10 +86,10 @@ class PDFParser(BaseCollector):
 
     async def collect(self, tickers: list[str]) -> dict:
         """
-        Find unparsed QUARTERLY_RESULT announcements and extract text.
+        Find unparsed announcements with a pdf_url and extract text.
 
         Steps:
-        1. Query DB for unparsed quarterly result announcements
+        1. Query DB for unparsed announcements (any category)
         2. Download each PDF via httpx
         3. Extract text with pdfplumber
         4. Store text in announcement.raw_text
@@ -72,12 +100,12 @@ class PDFParser(BaseCollector):
         """
         os.makedirs(self.PDF_DIR, exist_ok=True)
 
-        # Find unparsed quarterly result PDFs
+        # Find unparsed announcement PDFs (all categories — see module
+        # docstring for why this is not QUARTERLY_RESULT-only anymore)
         result = await self.db.execute(
             select(Announcement)
             .where(
                 and_(
-                    Announcement.category == "QUARTERLY_RESULT",
                     Announcement.pdf_parsed.is_(False),
                     Announcement.pdf_url.isnot(None),
                     Announcement.ticker.in_(tickers),
@@ -88,7 +116,7 @@ class PDFParser(BaseCollector):
         announcements = result.scalars().all()
 
         if not announcements:
-            logger.info("No unparsed quarterly result PDFs found")
+            logger.info("No unparsed announcement PDFs found")
             return {
                 "tickers_processed": 0,
                 "tickers_failed": 0,
@@ -105,7 +133,7 @@ class PDFParser(BaseCollector):
         async with httpx.AsyncClient(
             timeout=60.0, follow_redirects=True
         ) as client:
-            for ann in announcements:
+            for i, ann in enumerate(announcements, 1):
                 try:
                     success = await self._parse_announcement(client, ann)
                     if success:
@@ -123,13 +151,33 @@ class PDFParser(BaseCollector):
                     ann.pdf_parsed = True
                     failed += 1
 
-        await self.db.commit()
+                if i % self.COMMIT_EVERY == 0:
+                    await self._commit_batch()
+
+        await self._commit_batch()
 
         return {
             "tickers_processed": processed,
             "tickers_failed": failed,
             "records_inserted": processed,
         }
+
+    async def _commit_batch(self) -> None:
+        """
+        Commit accumulated updates, rolling back (and losing only this
+        batch) if a row is unstorable. Without the rollback, one bad
+        row leaves the session in PendingRollbackError and silently
+        kills every subsequent batch commit in the run — seen live
+        2026-07-18 before raw_text NUL-sanitization existed.
+        """
+        try:
+            await self.db.commit()
+        except Exception as e:
+            logger.error(
+                f"PDF batch commit failed — rolling back this batch "
+                f"and continuing: {type(e).__name__}: {e}"
+            )
+            await self.db.rollback()
 
     async def _parse_announcement(
         self, client: httpx.AsyncClient, ann: Announcement
@@ -194,6 +242,11 @@ class PDFParser(BaseCollector):
                         text_parts.append(text)
 
             full_text = "\n".join(text_parts)
+            # PostgreSQL text columns reject NUL bytes, and pdfplumber
+            # can emit \x00 from odd embedded fonts (seen live
+            # 2026-07-18: MCB's quarterly accounts →
+            # CharacterNotInRepertoireError on commit). Strip them.
+            full_text = full_text.replace("\x00", "")
 
             if not full_text.strip():
                 logger.warning(
@@ -207,12 +260,17 @@ class PDFParser(BaseCollector):
             ann.raw_text = full_text[: self.MAX_TEXT_LENGTH]
             ann.pdf_parsed = True
 
-            # Try to extract fiscal quarter and year
-            quarter, year = self._extract_period(full_text)
-            if quarter is not None:
-                ann.fiscal_quarter = quarter
-            if year is not None:
-                ann.fiscal_year = year
+            # Try to extract fiscal quarter and year — but only for
+            # quarterly-result documents. Running the period regexes on
+            # notices/disclosures would happily latch onto any stray
+            # year-like number and pollute fiscal_quarter/fiscal_year.
+            quarter, year = None, None
+            if ann.category == "QUARTERLY_RESULT":
+                quarter, year = self._extract_period(full_text)
+                if quarter is not None:
+                    ann.fiscal_quarter = quarter
+                if year is not None:
+                    ann.fiscal_year = year
 
             logger.info(
                 f"Parsed PDF for {ann.ticker}: "

@@ -33,3 +33,5 @@ Thumbs.db
 
 # Local Claude Code tooling (e.g. .claude/launch.json — preview-server config)
 .claude/
+# Downloaded announcement PDFs (PDFParser working files; DB raw_text is the deliverable)
+backend/data/announcements/

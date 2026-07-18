@@ -3005,3 +3005,156 @@ archives of the old model).
 **Protected files untouched:** confirmed via `git diff --stat` — none
 of `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
 `orchestrator.py` / `arbitrator.py` appear in the diff.
+
+## 2026-07-18 — Phase 5 Session 7: real announcements wired into FilingSceptic
+
+`filing_contribution` had been 0.0 for the entire life of the project.
+This session ends that. **First session ever to deliberately touch
+protected files** — scoped to `filing_skeptic.py` and `orchestrator.py`
+only; `trend_analyzer.py`, `news_synthesizer.py`, and `arbitrator.py`
+confirmed absent from the diff.
+
+### Part 1 — why it was always 0.0 (confirmed from code, not assumed)
+
+Not a placeholder: a data gate. `FilingSceptic.run()` filters
+`context.announcements` to rows with non-empty `raw_text`; all 94
+mirrored rows had `raw_text=NULL` (the Phase 2A `PDFParser` only ever
+processed `category='QUARTERLY_RESULT'` and was never pointed at the
+Phase 5 Session 2 mirror), so the agent always took its honest no-data
+branch (confidence 0.2, zero LLM calls). The full LLM path (prompt +
+RED_FLAGS/SEVERITY/ANALYSIS parser) already existed but analyzed only
+the single most recent filing. **Arbitrator needed zero changes, as the
+session brief hypothesized:** `_filing_contribution` applies
+`SEVERITY_PENALTY {LOW:-5, MEDIUM:-15, HIGH:-30}` whenever `red_flags`
+is non-empty — the slot was live all along, receiving empty lists.
+
+### Part 2 — substance check (measured on all 83 PDFs, not sampled)
+
+Every stored `pdf_url` was downloaded and text-extraction tested before
+designing anything: **51/83 (61%) have a real text layer** — including
+full quarterly accounts (15–39K chars), a PSO board-member resignation,
+CEO appointments, MARI's clarification of media reports on its Spinwam
+gas bidding, OGDC well discoveries, ENGROH buy-back reports — and
+**32/83 (39%) are image-only scans** (mostly "Disclosure of Interest"
+notices) yielding zero text. Titles alone range from substantive
+("Award of Eight New Offshore Blocks") to boilerplate. **Call:**
+full-text analysis with per-announcement title-only fallback; no OCR
+(no invented data); no new dependency (pdfplumber already present since
+Phase 2A); **no migration needed** (`raw_text` column existed unused
+since Phase 1A). Per-ticker text coverage is wildly uneven and now
+documented: PSO 10/10, MARI 9/10, ENGROH 8/10, OGDC 8/10 vs MEBL 1/5,
+HBL 2/9, PPL 3/10, LUCK 3/10, UBL 3/10, MCB 4/10.
+
+### The extraction run — two real bugs found and fixed live
+
+1. **Neon idle-timeout kills a single end-of-run commit.** The
+   broadened backlog (83 PDFs × download + 2s politeness sleep ≈ 7 min)
+   left the DB connection idle the whole loop; the final commit died
+   with `InterfaceError: connection is closed` and rolled back the
+   ENTIRE run (0 rows saved). Fix: `COMMIT_EVERY=10` batched commits
+   (safe: `expire_on_commit=False`) — progress is durable and the
+   connection stays warm.
+2. **NUL bytes in extracted PDF text.** MCB's 39K-char quarterly
+   accounts contain `\x00`, which PostgreSQL text columns reject
+   (`CharacterNotInRepertoireError`) — and the poisoned batch left the
+   session in `PendingRollbackError`, silently killing every later
+   batch. Fix: strip `\x00` before store + `_commit_batch()` does
+   rollback-and-continue so one bad row costs one batch, not the run.
+
+Also: fiscal-period regex now runs only on QUARTERLY_RESULT rows (it
+would latch onto stray years in notices), `--pdfs-only` added to the
+CLI runner, `backend/data/announcements/` gitignored (PDF working
+files). Final state, verified by direct SQL: **83/94 parsed, 51 with
+raw_text (620–21,633 chars)** — per-ticker counts byte-match the
+pre-design sweep. A categorization quirk was noted, not fixed: "Board
+Meeting for Agenda Other than Financial Results" maps to
+QUARTERLY_RESULT because the "financial results" keyword matches first.
+
+### Part 3 — the wiring
+
+- `orchestrator.py` (protected, permitted): announcement context dicts
+  gain `pdf_url`/`pdf_parsed`/`source`. That is the entire change.
+- `filing_skeptic.py` (protected, permitted): reviews the ≤10 most
+  recent announcements as one batch. Per announcement: extracted text
+  excerpt (1,500-char cap, 9,000-char shared budget, recency-first) →
+  `full_text`; no text → `title_only` with an explicit
+  do-not-speculate marker; text present but budget spent →
+  `text_omitted`. All modes persisted in the output (`reviewed` list) —
+  visibility is auditable, not hidden. Output adds
+  `data_availability` (FULL_TEXT/PARTIAL_TEXT/TITLES_ONLY/NONE) +
+  `full_text_count`/`title_only_count`. Confidence: 0.75 with flags,
+  0.6 without, hard-capped 0.45 if every document was title-only.
+  Prompt asks for the session's target red flags (related-party terms,
+  going-concern/audit qualifications, auditor changes, sudden
+  departures, penalties, defaults, insider selling, delayed results)
+  and explicitly instructs that routine disclosures (dividends,
+  buy-backs, briefing sessions, ESOS allotments, standard disclosures
+  of interest) are NOT red flags. Zero-announcement tickers keep the
+  no-LLM-call graceful branch. `_parse_response` unchanged; the
+  −5/−15/−30 scale kept as-is — it fits (see PSO below).
+
+### Part 4 — verification (7 real production-path runs)
+
+New harness `backend/scripts/verify_filing_sceptic.py` (runs the real
+`AnalysisOrchestrator`, dumps verbatim agent output + score breakdown +
+`llm_calls` audit rows; `--save`/`--diff` for controlled experiments).
+Baseline captured BEFORE any code change (same day, same data):
+
+- **Controlled diff (PPL/UBL/MEBL/ENGROH/OGDC): 15/15 technical/news/ml
+  terms byte-identical before→after.** Only the filing term changed.
+- **PSO — the first real penalty in project history:**
+  `filing_contribution = -15` (MEDIUM), conviction 50.0 → 35.0.
+  Red flags: "Resignation of Board Member", "Unexplained CEO
+  Appointment". LLM analysis (verbatim): *"The resignation of Mr.
+  Waheed Ahmed Shaikh, an Independent Member of the Board of
+  Management, as disclosed in document [3] on June 15, 2026, is a
+  notable event that warrants attention. Additionally, the title-only
+  disclosures [8] and [9] regarding the appointment and change in
+  effective date of the Chief Executive Officer raise questions about
+  potential leadership changes or instability. While these events are
+  not necessarily indicative of serious issues, they are worth
+  monitoring and investigating further…"* **Spot-checked against the
+  actual source PDF** (read directly, not via the LLM): the filing
+  does disclose exactly that resignation, effective 2026-06-11, with
+  no reason given — accurate read, not hallucination. MEDIUM (−15) for
+  a governance-transition cluster is at the stricter edge but within
+  the documented severity guide; flagged for human review rather than
+  silently retuned.
+- **The other 6 tickers returned genuine "nothing to flag" zeros** —
+  real LLM calls (1.5–3.2K tokens each), full reviewed-mode logs, and
+  measured analyses that match the underlying documents (e.g. MARI's
+  Spinwam clarification judged non-concerning; ENGROH's CEO
+  *appointment* correctly not treated as a departure; OGDC's TFC
+  interest *receipts* correctly read as routine). This is the critical
+  distinction from the old zero: reviewed-and-clean vs no-data (the
+  old branch shows 0 tokens; the new ones show real token spend).
+- **Gateway routing proven, not assumed:** grep shows no Groq/Gemini
+  SDK references anywhere in `app/agents/` (only `self.llm.complete()`),
+  and the `llm_calls` audit table logged all 7 `filing_skeptic` calls
+  (llama-3.3-70b-versatile, SUCCESS) — the gateway wrote those rows.
+- **Cost/latency impact:** FilingSceptic prompts run 1.4–3.1K prompt
+  tokens (was: no call at all). Per-report totals: ~2.7–5.1K tokens vs
+  ~1.5–2.2K before. Latency typically +1.3–2s per report; two Groq
+  spikes to 10–14s observed. Still trivial on Groq free tier.
+- One cosmetic LLM quirk: with zero flags the model sometimes answers
+  `SEVERITY: NONE` (not in the LOW/MEDIUM/HIGH vocabulary) — the
+  existing parser logs a warning and defaults to LOW with empty flags,
+  which contributes 0.0 regardless. Left as-is.
+
+DB after the session: `intelligence_reports` 19 rows (+12 verification
+runs), `llm_calls` 52 rows (+36; first 7 `filing_skeptic` calls ever).
+Redis note: cached `GET /report` responses serve pre-session shapes
+until TTL expiry — same known quirk as Phase 4 Session 2.
+
+### Files touched
+
+Protected (permitted this session): `backend/app/agents/filing_skeptic.py`,
+`backend/app/agents/orchestrator.py`.
+Unprotected: `backend/app/collectors/pdf_parser.py`,
+`backend/app/collectors/pipeline.py` (docstring only),
+`backend/scripts/run_pipeline.py` (`--pdfs-only`), `.gitignore`.
+New: `backend/scripts/verify_filing_sceptic.py`.
+Docs: `CLAUDE.md`, `docs/KNOWN_ISSUES.md`, this file.
+
+**`trend_analyzer.py`, `news_synthesizer.py`, `arbitrator.py` untouched**
+— verified via `git diff --name-only` (they do not appear at all).

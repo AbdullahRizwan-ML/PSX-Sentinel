@@ -13,6 +13,7 @@ Usage from the backend/ directory:
     python scripts/run_pipeline.py --fundamentals-only
     python scripts/run_pipeline.py --dunya-only
     python scripts/run_pipeline.py --flows-only
+    python scripts/run_pipeline.py --pdfs-only
 """
 
 import argparse
@@ -34,6 +35,7 @@ async def main(
     fundamentals_only: bool = False,
     dunya_only: bool = False,
     flows_only: bool = False,
+    pdfs_only: bool = False,
 ) -> None:
     """
     Main async entry point for the pipeline runner.
@@ -103,6 +105,14 @@ async def main(
 
             result = await DunyaNewsCollector(db).run_safe(tickers)
             logger.info(f"Dunya News collection result: {result}")
+            return
+
+        # ── PDF parsing only ──────────────────────────────────────────
+        if pdfs_only:
+            from app.collectors.pdf_parser import PDFParser
+
+            result = await PDFParser(db).run_safe(tickers)
+            logger.info(f"PDF parsing result: {result}")
             return
 
         # ── Fundamentals only ─────────────────────────────────────────
@@ -187,6 +197,15 @@ Examples:
             "docstring)"
         ),
     )
+    parser.add_argument(
+        "--pdfs-only",
+        action="store_true",
+        help=(
+            "Only download + text-extract announcement PDFs into "
+            "announcements.raw_text (all categories; image-only PDFs "
+            "leave raw_text NULL)"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -209,6 +228,7 @@ Examples:
         else "fundamentals-only" if args.fundamentals_only
         else "dunya-only" if args.dunya_only
         else "flows-only" if args.flows_only
+        else "pdfs-only" if args.pdfs_only
         else "full pipeline"
     )
     print(f"Mode: {_mode}")
@@ -223,5 +243,6 @@ Examples:
             fundamentals_only=args.fundamentals_only,
             dunya_only=args.dunya_only,
             flows_only=args.flows_only,
+            pdfs_only=args.pdfs_only,
         )
     )
