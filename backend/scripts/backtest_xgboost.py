@@ -96,16 +96,20 @@ Round-trip is charged as two components:
   achievable at the printed close. On thin PSX names this is optimistic;
   it is flagged here and in the results doc as a known simplification.
 
-AGGREGATION - the ENGRO caveat
-------------------------------
-ENGRO's test window (Aug-Dec 2024) is DISJOINT from the other 9 tickers'
-test window (Oct 2025 - May 2026), because ENGRO has a shorter price
-history in the DB (docs/KNOWN_ISSUES.md). Stitching a disjoint window
-into one equity curve would inject ~10 months of flat-cash days that
-distort an annualised Sharpe. So the headline SLEEVE aggregate is the 9
-common-window tickers, equal-weight, over their single shared window.
-ENGRO is still fully reported - as its own line in the per-ticker table,
-against its own buy-and-hold - just not folded into the sleeve curve.
+AGGREGATION - the disjoint-window caveat
+----------------------------------------
+When a ticker's test window is DISJOINT from the rest (as delisted
+ENGRO's Aug-Dec 2024 window was, pre-Session-6), stitching it into one
+equity curve would inject months of flat-cash days that distort an
+annualised Sharpe - so such a ticker is reported standalone, outside the
+headline sleeve. Since the Phase 5 Session 6 retrain (ENGROH replaced
+ENGRO in the training universe) every ticker shares one common window
+and the sleeve is all of them; the standalone section only renders if
+the disjoint ticker is present in test.parquet. (ENGROH's test window
+starts 11 days later than the others' - 2025-12-08 vs 2025-11-27, its
+series is slightly shorter - which the sleeve handles as flat cash
+before entry, same as always. That is an overlap difference, not a
+disjoint window.)
 
 USAGE (from backend/ with venv active):
     python scripts/backtest_xgboost.py
@@ -143,8 +147,13 @@ CGT_RATE = 0.15            # 15% on net realised gain, filer, <12mo hold
 INIT_CASH = 10_000.0       # per ticker sleeve leg
 TRADING_DAYS = 252         # PSX ≈ 252 sessions/yr, used for Sharpe annualisation
 
-# The 9 tickers that share the common Oct-2025..May-2026 test window.
-# ENGRO is handled separately (disjoint 2024 window - see module docstring).
+# ENGRO's test window was disjoint from the other tickers' (2024 vs
+# 2025-26) back when it was in the dataset - it was reported standalone,
+# outside the sleeve. Since the Phase 5 Session 6 retrain the universe is
+# ENGROH-based and every ticker shares one common window, so this ticker
+# is simply absent from test.parquet and the standalone section is
+# skipped. Kept (rather than deleted) so re-running against the archived
+# pre-Session-6 parquets still reports correctly.
 DISJOINT_TICKER = "ENGRO"
 
 
@@ -327,7 +336,7 @@ def main() -> None:
     model.load_model(str(MODEL_PATH))
 
     print("=" * 78)
-    print("PSX SENTINEL - XGBoost out-of-sample backtest (Phase 5 Session 1)")
+    print("PSX SENTINEL - XGBoost out-of-sample backtest")
     print("=" * 78)
     print(f"Model            : {MODEL_PATH.name} (loaded as-is, not retrained)")
     print(f"Test rows        : {len(test):,}  across {test['ticker'].nunique()} tickers")
@@ -443,13 +452,18 @@ def main() -> None:
             "n_trades": stats["n_trades"],
         }
 
+    n_sleeve = len(common_tickers)
+    sleeve_min = test[test["ticker"].isin(common_tickers)]["date"].min().date()
+    sleeve_max = test[test["ticker"].isin(common_tickers)]["date"].max().date()
     print("=" * 78)
     print("HEADLINE SLEEVE AGGREGATE")
-    print(f"  9 equal-weight tickers over the shared window "
-          f"{test[test['ticker']=='PPL']['date'].min().date()} "
-          f"-> {test[test['ticker']=='PPL']['date'].max().date()}")
-    print(f"  (ENGRO excluded - disjoint 2024 window; see per-ticker table)")
-    print(f"  Sleeve capital = 9 x ${INIT_CASH:,.0f} = ${9*INIT_CASH:,.0f}")
+    print(f"  {n_sleeve} equal-weight tickers over the shared window "
+          f"{sleeve_min} -> {sleeve_max}")
+    if DISJOINT_TICKER in test["ticker"].unique():
+        print(f"  ({DISJOINT_TICKER} excluded - disjoint window; "
+              f"see per-ticker table)")
+    print(f"  Sleeve capital = {n_sleeve} x ${INIT_CASH:,.0f} "
+          f"= ${n_sleeve*INIT_CASH:,.0f}")
     print("=" * 78)
     print()
     sleeve = {}
@@ -462,7 +476,7 @@ def main() -> None:
         f"{COMMISSION_PER_SIDE*100:.2f}%/side"
     )
     sleeve["buyhold"] = sleeve_report(
-        "BUY & HOLD benchmark (all 9, equal weight)", bh_pfs,
+        f"BUY & HOLD benchmark (all {n_sleeve}, equal weight)", bh_pfs,
         f"{COMMISSION_PER_SIDE*100:.2f}%/side entry"
     )
 
@@ -477,23 +491,25 @@ def main() -> None:
         "BUY & HOLD @ 0.05%/side", bh_pfs_disc, "0.05%/side entry"
     )
 
-    # ── 4. ENGRO standalone (disjoint window) ────────────────────────────
-    print("-" * 78)
-    print("ENGRO - standalone (disjoint 2024 test window, not in sleeve)")
-    print("-" * 78)
-    for label, pf in [
-        ("Ungated", ungated_pfs[DISJOINT_TICKER]),
-        ("Gated", gated_pfs[DISJOINT_TICKER]),
-        ("Buy&Hold", bh_pfs[DISJOINT_TICKER]),
-    ]:
-        m = curve_metrics(pf.value())
-        print(
-            f"  {label:<9} return {_fmt_pct(m['total_return']):>9}  "
-            f"Sharpe {_fmt_sharpe(m['sharpe']):>7}  "
-            f"maxDD {_fmt_pct(m['max_dd']):>9}  "
-            f"trades {int(pf.trades.count())}"
-        )
-    print()
+    # ── 4. Disjoint-window ticker standalone (skipped when absent) ───────
+    if DISJOINT_TICKER in ungated_pfs:
+        print("-" * 78)
+        print(f"{DISJOINT_TICKER} - standalone (disjoint test window, "
+              f"not in sleeve)")
+        print("-" * 78)
+        for label, pf in [
+            ("Ungated", ungated_pfs[DISJOINT_TICKER]),
+            ("Gated", gated_pfs[DISJOINT_TICKER]),
+            ("Buy&Hold", bh_pfs[DISJOINT_TICKER]),
+        ]:
+            m = curve_metrics(pf.value())
+            print(
+                f"  {label:<9} return {_fmt_pct(m['total_return']):>9}  "
+                f"Sharpe {_fmt_sharpe(m['sharpe']):>7}  "
+                f"maxDD {_fmt_pct(m['max_dd']):>9}  "
+                f"trades {int(pf.trades.count())}"
+            )
+        print()
     print("Done.")
 
 

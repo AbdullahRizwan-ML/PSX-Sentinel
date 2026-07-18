@@ -358,6 +358,16 @@ consistently nonzero, because:
   accuracy, same gate, same near-0.4 probability cluster) — only the
   visibility changed, not the prediction quality.
 
+  **Update (Phase 5 Session 6, 2026-07-18):** the model WAS retrained
+  (full-depth window, ENGROH universe — test accuracy 39.34% → 43.19%,
+  and it now beats the always-UP naive baseline, which the old model
+  did not) — but the live max_prob cluster only moved to
+  [0.368, 0.434], so **still no ticker clears the 0.55 gate on the
+  latest day** and production `ml_contribution` remains 0.0 by design.
+  The retrained model is also heavily UP-skewed (82% of test
+  predictions UP, DOWN recall 0.20, FLAT still ~never predicted) —
+  a caveat documented in `docs/BACKTEST_RESULTS.md`.
+
 **Expected to ease once:** PUCARS scraping produces real filing data
 (lets `filing_contribution` actually vary), and/or a future ML
 retraining lifts at least some tickers past the 0.55 gate. Flagging
@@ -421,9 +431,14 @@ price rows (2021-07-19 → 2026-07-16), fundamentals (P/E 4.99, mkt cap 320B,
 free float 18.04%; dividend_yield NULL at source), 10 mirrored announcements.
 **ENGRO stays as a frozen historical record:** its 887 price rows and
 `delisted_date=2025-01-14` are untouched, it is NOT in the active collection
-universe, and nothing backfills it further. Still deferred (own session): the
-ML dataset / backtest decision on whether to *train* on ENGROH — this session
-deliberately did not touch `ml_data/`.
+universe, and nothing backfills it further.
+
+**Resolved for ML too (Phase 5 Session 6, 2026-07-18):** the train/val/test
+split and the XGBoost model were rebuilt on the 10-active-ticker universe —
+**ENGROH trained on (full continuous history), delisted ENGRO excluded
+entirely**. All 10 tickers now share one common test window, so the
+disjoint-ENGRO-window caveat in the Session 1 backtest no longer applies to
+the current dataset. See `docs/BACKTEST_RESULTS.md` (Session 6 section).
 
 ---
 

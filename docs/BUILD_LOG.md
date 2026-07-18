@@ -2888,3 +2888,120 @@ gitignored (loaded into Postgres; DB is the source of truth).
 **Protected files untouched:** `git diff --stat` shows none of
 `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
 `orchestrator.py` / `arbitrator.py`.
+
+## 2026-07-18 — Phase 5 Session 6: ML retrain on full-depth window (ENGROH universe) + backtest re-run
+
+Pure data/ML-pipeline session: rebuilt the train/val/test split on the
+post-Session-5 data, retrained XGBoost with identical hyperparameters,
+re-ran the Session 1 backtest methodology unchanged. Nothing about how
+the model is *used* changed — Arbitrator/inference wiring, the 0.55
+gate, and the 5% ML weight are all untouched. None of the five protected
+files touched.
+
+### Honest correction of the session premise, first
+
+The brief said the original split was built on "the old, much shorter
+window." **That premise is wrong, and was verified wrong before
+building:** the Phase 3 Session 1 dataset build read 12,025 raw rows
+(~5 years/ticker) because PSX DPS always served its full rolling window
+regardless of the old `HISTORY_DAYS=730` setting — the old labeled
+dataset already spanned 2022-06 → 2026-05. The real deltas this session
+trains on are (a) **ENGROH's full continuous history replacing delisted
+ENGRO's truncated one** and (b) **~6 weeks of newer data** (Session 5's
+253-row top-up). Net: 10,050 labeled rows vs 9,465 (+6.2%). Reported
+plainly rather than letting the session oversell itself.
+
+### Part 1 — split rebuild (methodology unchanged, re-proven)
+
+- `build_ml_dataset.py` re-run as-is — it reads `PSX_TICKERS`, which
+  already carries the Session 4 universe (ENGROH in, ENGRO out), so the
+  universe change required zero code edits. Same per-ticker
+  chronological 70/15/15, same feature pipeline, same split adjustments.
+- **Corporate-action scan re-run first** (`find_split_row.py` against
+  the live DB): the only −50%+ overnight signatures are the three
+  already-adjusted splits (MARI/LUCK/UBL). ENGROH's extremes (+18.5%
+  day, +32% 5-day — Dec 2024 merger-rally era) are real moves, not
+  splits. `split_adjustments.py` needed no new rows.
+- Result: **10,050 labeled rows** (train 7,034 / val 1,504 / test
+  1,512), 10 tickers, one common calendar — the disjoint-ENGRO-window
+  problem is gone by construction. Test window 2025-11-27 → 2026-07-10
+  (ENGROH enters 2025-12-08, its series being slightly shorter).
+- **No-leakage re-proven fresh, both ways:** `verify_dataset.py`
+  chronological invariant (train_max < val_min < val_max < test_min)
+  passes for all 10 tickers, and the backtest's independent per-ticker
+  `test_min > val_max` assertion matches those boundaries exactly.
+- Minor flag: test-split FLAT share is 19.1%, a hair under the 20%
+  floor Session 1 observed. Noted, not material (FLAT is structurally
+  unpredicted anyway).
+
+### Part 2 — retrain (same hyperparameters, seed=42)
+
+**Test accuracy 43.19% vs the old 39.34%** (random baseline 33.33%);
+best iteration 34 (old 27). Old artifacts archived in `ml_data/` as
+`model_phase3s2_backup.json` / `metrics_phase3s2_backup.json`
+(gitignored, like all of `ml_data/`).
+
+The more honest yardstick, computed this session for both models: the
+**always-UP naive baseline**. Old model: 39.34% vs 40.25% always-UP —
+i.e. the old model was *worse than majority-class guessing* on its test
+set. New model: **43.19% vs 40.81% (+2.4pp)** — the first time the
+model beats the majority class, not just random chance. Trade-off
+flagged plainly: the new model is heavily UP-skewed (82% of test
+predictions UP; DOWN recall 0.20; FLAT still unlearned, 3 predictions).
+
+### Part 3 — backtest re-run (methodology identical)
+
+`backtest_xgboost.py` needed only mechanical de-hardcoding (dynamic
+sleeve size/window instead of literal "9"/PPL-dates, and the
+ENGRO-standalone section now renders only if a disjoint ticker exists in
+the parquet — kept for archived-parquet reruns). Costs, rules, CGT, and
+sensitivity all unchanged. Full numbers + before/after tables in
+`docs/BACKTEST_RESULTS.md`; headline (10-ticker sleeve, 0.30%
+round-trip, pre-CGT):
+
+| | Session 1 (old) | Session 6 (new) |
+|---|---|---|
+| Ungated | +5.10%, Sharpe 0.43, maxDD −21.30%, 63 trades | **+18.36%, Sharpe 1.12, maxDD −19.37%, 70 trades** |
+| Gated (>0.55) | +2.35%, Sharpe 0.42, maxDD −5.70%, 22 trades | **+5.57%, Sharpe 0.99, maxDD −4.30%, 26 trades** |
+| Buy & Hold | +3.33%, Sharpe 0.33, maxDD −24.41% | +13.81%, Sharpe 0.81, maxDD −21.79% |
+
+**Windows differ** (old 2025-10-24→2026-05-29, new 2025-11-27→
+2026-07-10, ~6 months overlap, new one distinctly more bullish), so the
+meaningful comparison is excess-vs-own-window-B&H: ungated excess return
++1.77pp → **+4.55pp**, excess Sharpe +0.10 → **+0.31**. Gate clears:
+99/1,512 rows (6.5%, all UP).
+
+**Honest read:** a modestly stronger edge, NOT a multi-regime
+validation. The brief hoped the new test span would cross "more market
+conditions" — it doesn't: more data shifts the chronological 15% tail
+later, producing another single ~7.4-month window, largely overlapping
+the old one and strongly bullish throughout. The UP-skewed model would
+be long nearly all the way down a sustained bear market. Same bottom
+line as Session 1, upgraded one notch: the signal is real after costs
+and now beats naive baselines, but this still does not establish a
+deployable strategy.
+
+### Verification (live, not claimed)
+
+- `verify_dataset.py`: 10/10 chronological invariant OK; worst forward
+  return −25.4% (OGDC 2024-02-12, genuine) — no split contamination.
+- Backtest run twice — numbers reproduce exactly.
+- **Production inference path exercised with the new artifact**:
+  `probe_ml_signal.py` (read-only) scores all 10 active tickers via the
+  same `inference.py` module the Arbitrator uses; ENGRO degrades to
+  `insufficient_history` as designed. New live max_prob cluster
+  0.368–0.434 (old 0.357–0.407) — still nobody clears 0.55 on the
+  latest day, so production `ml_contribution` stays 0.0 by design.
+
+### Files touched
+
+Modified: `backend/scripts/backtest_xgboost.py` (dynamic sleeve/
+standalone handling only — methodology untouched), `CLAUDE.md`,
+`docs/BACKTEST_RESULTS.md`, `docs/KNOWN_ISSUES.md`, this file.
+Regenerated (gitignored, not committed): `backend/ml_data/{train,val,
+test}.parquet`, `model.json`, `metrics.json` (+ the two `*_backup`
+archives of the old model).
+
+**Protected files untouched:** confirmed via `git diff --stat` — none
+of `trend_analyzer.py` / `news_synthesizer.py` / `filing_skeptic.py` /
+`orchestrator.py` / `arbitrator.py` appear in the diff.
