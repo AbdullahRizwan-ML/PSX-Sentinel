@@ -4531,3 +4531,84 @@ Build Log entry carries the numbers).
 
 **End of session: local `main` pushed, HEAD == origin/main** (see the push
 immediately following this commit).
+
+## 2026-09-09 — Hotfix: Gemini fallback was still hardcoded to the dead model
+
+**What was found.** Phase 6 Session 1 (earlier today) repinned
+`LLMGateway.PRIMARY_MODEL` / `.FALLBACK_MODEL` to working models
+(`openai/gpt-oss-120b` / `gemini-3.6-flash`) but only touched the two
+class-level constants. Inside `complete()`'s Gemini fallback branch, the
+actual call was `genai.GenerativeModel("gemini-2.0-flash")` — a hardcoded
+string literal, NOT `self.FALLBACK_MODEL`. So the Groq `create()` call
+already used its constant (`model=self.PRIMARY_MODEL`) but the Gemini path
+did not: `model_used` (the value written to the `llm_calls` audit row) was
+set to `self.FALLBACK_MODEL` while the model *actually sent to the API* was
+the dead `gemini-2.0-flash` — a silent divergence that would have logged
+`gemini-3.6-flash` to the DB while calling a 404'd model, i.e. every real
+Gemini fallback would still fail but the audit trail wouldn't show why.
+
+**Why Session 1's probe didn't catch it.** That probe's 26/26 successful
+calls all went through Groq primary — the Gemini fallback path was *never
+exercised* (0 fallbacks), so the stale literal sat behind a branch nothing
+hit. Confirmed in the Session 1 entry above: "the Gemini fallback path was
+never exercised (0 fallback calls)."
+
+**The fix** (one line, `llm_gateway.py` only — the same file Session 1
+touched; not on the protected-file list, flagged here per the same
+convention Session 1 used):
+
+```diff
+                 model_used = self.FALLBACK_MODEL
+-                gemini_model = genai.GenerativeModel("gemini-2.0-flash")
++                gemini_model = genai.GenerativeModel(self.FALLBACK_MODEL)
+```
+
+`FALLBACK_MODEL` is now the single source of truth, exactly like the Groq
+call already does with `PRIMARY_MODEL`. A grep of the whole `backend/`
+(excluding `venv/`) for `gemini-2.0` / `llama-3.3` confirmed this line 186
+literal was the ONLY remaining live pin — every other hit is either this
+file's own explanatory comment or a historical Build Log / doc record.
+
+**Live end-to-end verification of the fallback path** (the constant being
+referenced correctly is necessary but not sufficient — the Groq-success
+probe of Session 1 can't prove the Gemini branch). A one-off script forced
+Groq to fail for a single real call by temporarily shadowing
+`PRIMARY_MODEL` on the instance with a bogus model id (a real Groq 404 —
+the exact failure mode the original outage produced), reverted via `del`
+immediately after, then a second normal call proved full restore:
+
+- **(a) real Gemini completion:** Groq 404 → Gemini returned `content='PONG'`
+  (non-empty, real).
+- **(b) model actually sent == the constant, not just the logged value:**
+  `genai.GenerativeModel(...)` was *spied* (wrapped to capture its argument
+  before delegating to the real constructor) — captured arg was
+  `'gemini-3.6-flash'` == `FALLBACK_MODEL`; `resp.model` matched; and the
+  `llm_calls` row for that call recorded `model='gemini-3.6-flash'`,
+  `status='SUCCESS'`. So the DB log and the real API call now agree.
+- **(c) circuit-breaker reset on Gemini success:** proven by spying that
+  the Gemini-success path *invokes* `reset_circuit_breaker(agent)` with the
+  correct agent name (it does). The usual value-transition proof (2 → 0)
+  was NOT observable in this environment because **Upstash Redis is
+  currently DNS-unreachable from this host** (`getaddrinfo failed` on
+  `witty-lobster-139116.upstash.io:6379`, confirmed persistent across
+  retries) — so the circuit breaker is in its by-design fail-open state
+  (all reads return 0, writes are silent no-ops) and the reset's effect
+  can't be seen, only its invocation. This Redis outage is a separate,
+  pre-existing environmental condition (it also silently disabled the
+  breaker during Session 1's probe), NOT introduced by this hotfix and
+  out of its scope — flagged here for visibility, not fixed.
+- **(d) full restore:** after the `del`, a second real call went Groq-primary
+  and succeeded with `model='openai/gpt-oss-120b'`, `content='PING'`, and
+  `genai.GenerativeModel` was NOT called (empty spy list) — confirming the
+  temporary break was fully reverted and the primary path is intact.
+
+Verification script lived in scratchpad (not committed — scope is
+`llm_gateway.py` only). Docs updated the same pass: `README.md`'s
+architecture diagram + tech-stack table (the two living "current stack"
+claims) now read `gpt-oss-120b` / `Gemini 3.6 Flash`. `CLAUDE.md`'s routing
+line was already correct from Session 1; its remaining `llama-3.3` mentions
+are dated historical build-state/DB-snapshot records and were intentionally
+left (append-only). `KNOWN_ISSUES.md`'s Session 1 "models went dead"
+resolved-entry is likewise a correct historical record, left as-is.
+
+**End of hotfix: local `main` pushed, HEAD == origin/main.**

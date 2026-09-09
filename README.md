@@ -72,7 +72,7 @@ Dead sources (Yahoo Finance, Dawn/Business Recorder RSS, static PSX portal scrap
 │                              │                              │
 │  ┌───────────────────────────▼────────────────────────────┐ │
 │  │  LLMGateway — the single chokepoint for every LLM call │ │
-│  │  Groq (Llama 3.3-70B) → Gemini 2.0 Flash failover      │ │
+│  │  Groq (gpt-oss-120b) → Gemini 3.6 Flash failover       │ │
 │  │  circuit breaker · cost tracking · full audit log      │ │
 │  └────────────────────────────────────────────────────────┘ │
 └──────────────────────────┬──────────────────────────────────┘
@@ -109,7 +109,7 @@ A Next.js 15 (App Router) + TypeScript app with a hand-built design system — *
 |---|---|
 | Backend | FastAPI · SQLAlchemy 2.0 (async) · Pydantic v2 · Alembic |
 | Data & queue | PostgreSQL (Neon) · Redis (Upstash) · Celery |
-| AI | Custom agent orchestration · Groq (Llama 3.3-70B) + Gemini 2.0 Flash failover · XGBoost |
+| AI | Custom agent orchestration · Groq (gpt-oss-120b) + Gemini 3.6 Flash failover · XGBoost |
 | Collection | httpx · pdfplumber · Playwright · custom SSR-payload parsers |
 | Backtesting | vectorbt · pandas |
 | Frontend | Next.js 15 · TypeScript · Tailwind · lightweight-charts |

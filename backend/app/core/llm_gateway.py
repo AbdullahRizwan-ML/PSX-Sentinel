@@ -183,7 +183,7 @@ class LLMGateway:
                     raise RuntimeError("No Gemini API key configured")
 
                 model_used = self.FALLBACK_MODEL
-                gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+                gemini_model = genai.GenerativeModel(self.FALLBACK_MODEL)
 
                 # Convert OpenAI-style messages to Gemini plain-text format
                 prompt_text = "\n".join(
