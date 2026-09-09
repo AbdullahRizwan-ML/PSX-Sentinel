@@ -4612,3 +4612,85 @@ left (append-only). `KNOWN_ISSUES.md`'s Session 1 "models went dead"
 resolved-entry is likewise a correct historical record, left as-is.
 
 **End of hotfix: local `main` pushed, HEAD == origin/main.**
+
+## 2026-09-10 — Hotfix: Redis restored (new Upstash instance)
+
+**What was dead.** The prior diagnostic session (2026-09-09) confirmed
+`witty-lobster-139116.upstash.io` — the Redis instance backing
+`REDIS_URL`/`CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` since Phase 1B —
+returned an authoritative NXDOMAIN from Google's own public resolver
+(8.8.8.8), not a local network issue: three other real hosts (including
+`api.groq.com`, called successfully by this same app) resolved fine from
+the identical environment at the identical moment. Last confirmed-live
+date in this Build Log was 2026-06-28 (Phase 4 Sessions 4/5, a real
+`redis-py` round-trip against a live rate-limit key); nothing after that
+touched Redis until the outage was discovered — a ~10-week silent gap,
+possible precisely because every Redis call in this codebase fails open
+by design (`redis_client.py`'s stated contract: "All methods fail
+silently on Redis errors").
+
+**Likely cause (my best read, not confirmed by Upstash support):**
+Upstash's free tier auto-deletes databases after a period of inactivity.
+The instance was last touched 2026-06-28 and was gone by 2026-09-09 — a
+~10-week idle window is consistent with that policy, but nobody has
+verified this with Upstash directly; it's the most likely explanation
+given the evidence, not a confirmed fact. Flagging the distinction rather
+than stating it as settled.
+
+**The fix.** Abdullah created a new Upstash database
+(`clever-emu-152564.upstash.io`) and pasted the connection string
+directly into this session (never written to chat/docs anywhere else,
+per his instruction). `backend/.env` (gitignored — confirmed via
+`git check-ignore -v backend/.env` before touching it, unchanged) updated
+for all three vars — `REDIS_URL`, `CELERY_BROKER_URL` (`/1`),
+`CELERY_RESULT_BACKEND` (`/2`) — same db-index pattern as before. One
+scheme correction: the string as pasted used `redis://`; written instead
+as `rediss://` (TLS), matching this project's established convention and
+Upstash's normal requirement — verified live rather than assumed (see
+below), not silently "corrected" on faith.
+
+**Checked, not assumed, before editing:** `CELERY_BROKER_URL`/
+`CELERY_RESULT_BACKEND` DO exist as separate `.env` vars and BOTH also
+pointed at the dead `witty-lobster` host (same credential, `/1`/`/2`
+suffixes) — all three needed the same edit, not just `REDIS_URL`.
+`backend/app/core/config.py` has fallback defaults
+(`REDIS_URL: str = "redis://localhost:6379/0"`, same pattern for the two
+Celery vars) — these are generic `localhost` dev placeholders, not the
+dead host, and since `.env` supplies real values for all three keys,
+pydantic-settings' `env_file` loading overrides these class-level
+defaults; confirmed no OS-level environment variable was shadowing `.env`
+either (`env | grep REDIS_URL` etc. — empty). No `config.py` change was
+needed or made.
+
+**Live verification (Step 2, all four proofs — the DNS-only check that
+gave false confidence for ten weeks isn't good enough here):**
+
+- **(a) Real connection, not just DNS:** `RedisClient()` (the app's own
+  class, exact construction path as the production singleton) → raw
+  `PING` → `True` in 859ms, a genuine round-trip to the new instance.
+- **(b) SET/GET round-trip:** wrote a random per-run value via
+  `set_cached()`, read it back via `get_cached()` — byte-identical match,
+  then cleaned up via `delete_cached()`.
+- **(c) Circuit-breaker value-transition proof** (the one thing the prior
+  session explicitly could NOT do, since Upstash was unreachable then):
+  seeded a probe agent's failure count 0→3 via three real
+  `increment_circuit_breaker()` calls, confirmed `get_circuit_breaker_
+  failures()` read back `3`, called `reset_circuit_breaker()`, confirmed
+  it read back `0`. Both transitions correct.
+- **(d) Real backend boot + live HTTP hit:** started the actual
+  `uvicorn app.main:app` process (`.claude/launch.json`'s `psx-backend`
+  config — not a hand-rolled script), waited for `init_db()`/startup to
+  finish, hit `GET /api/v1/health` for real over HTTP:
+  `{"status":"healthy","database":"connected","redis":"connected",
+  "last_pipeline_run":"2026-07-18T13:19:12.864546+00:00","version":
+  "1.0.0"}`. `redis` now reads `"connected"`, not silently absent from
+  the response — proof from the live process, not a process-started-
+  cleanly assumption. Server stopped after the check.
+
+**Scope:** `backend/.env` only (gitignored, never committed — confirmed
+before and after). No `config.py` change was needed. No
+agent/orchestrator/scoring files touched. `docs/KNOWN_ISSUES.md` grepped
+for "Redis"/"Upstash" — zero matches, so nothing there claimed Redis was
+working and nothing needed correcting; left untouched per the brief.
+
+**End of hotfix: local `main` pushed, HEAD == origin/main.**
