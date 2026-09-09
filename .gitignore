@@ -41,3 +41,4 @@ backend/data/announcements/
 backend/baseline.json
 backend/after.json
 backend/s8_*.json
+backend/phase6_*.json

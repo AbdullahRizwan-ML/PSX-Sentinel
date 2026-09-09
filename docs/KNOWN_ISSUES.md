@@ -502,6 +502,44 @@ the current dataset. See `docs/BACKTEST_RESULTS.md` (Session 6 section).
 
 ## Resolved
 
+### LLMGateway's pinned models both went dead provider-side — RESOLVED 2026-09-09
+
+**Was:** `LLMGateway.PRIMARY_MODEL` ("llama-3.3-70b-versatile", Groq) and
+`.FALLBACK_MODEL` ("gemini-2.0-flash", Gemini) — live and working as of
+Phase 5 Session 8 (2026-07-18) — were both dead by Phase 6 Session 1
+(2026-09-09), discovered when a probe script's first run failed 26/26 real
+LLM calls with identical errors on every agent. Not a bug in any agent or
+in the calling code: Groq had dropped the entire Llama chat-model lineup
+from its catalog (confirmed via a live `GET /openai/v1/models` — no
+`llama-3.x` model remains at all), and Gemini had retired the 2.0 Flash
+line (its own 404 response named `gemini-3.6-flash` as the direct
+replacement). This broke every LLM call in the live app, not just the
+probe — a pre-existing, session-independent production outage that nothing
+in the codebase would have surfaced until the next real agent invocation.
+
+**Fix:** Repinned to `openai/gpt-oss-120b` (Groq) and `gemini-3.6-flash`
+(Gemini), chosen from each provider's live model listing and verified with
+real completions — including against `TrendAnalyzer`'s actual prompt shape
+at its real `max_tokens=800` — before being pinned, not just confirmed to
+exist. `gpt-oss-120b` is a **reasoning model**: part of `max_tokens` is
+spent on a hidden `message.reasoning` field before the visible answer
+(`usage.completion_tokens_details.reasoning_tokens`), so a completion can
+come back with empty `content` if `max_tokens` is too tight for reasoning +
+answer combined (`content=''` was seen at `max_tokens=20` in testing). At
+the token budgets the three agents currently use (800-1000), verified
+comfortable headroom (a real `TrendAnalyzer` prompt used 213 of 800 tokens,
+`finish_reason='stop'`) — but this is a real behavioral difference from the
+old non-reasoning Llama model and is worth remembering if a future agent
+sets a much smaller `max_tokens`, or if per-agent cost/latency starts to
+matter (gpt-oss's hidden reasoning tokens are billed the same as visible
+ones).
+
+Re-verified end-to-end after the fix (Phase 6 Session 1's probe,
+`backend/scripts/probe_point_in_time_context.py`): 26/26 real LLM calls
+succeeded, all on Groq primary (0 Gemini fallbacks exercised), cross-checked
+against the `llm_calls` audit table. See `docs/BUILD_LOG.md`, 2026-09-09,
+for the full diagnosis and the exact diff.
+
 ### PriceChart doesn't re-theme on dark-mode toggle — RESOLVED 2026-07-04
 
 **Was:** `frontend/src/components/price-chart.tsx` kept whatever theme was

@@ -69,8 +69,24 @@ class LLMGateway:
     """
 
     CIRCUIT_BREAKER_THRESHOLD: int = 3
-    PRIMARY_MODEL: str = "llama-3.3-70b-versatile"
-    FALLBACK_MODEL: str = "gemini-2.0-flash"
+    # Phase 6 Session 1 (2026-09-09): the previous pins
+    # (llama-3.3-70b-versatile / gemini-2.0-flash) both went dead
+    # between Phase 5 Session 8 (2026-07-18) and this session — Groq
+    # dropped the Llama chat lineup from its catalog entirely (confirmed
+    # via GET /openai/v1/models: no llama-3.x model remains), and Gemini
+    # 2.0 Flash was retired (its own 404 pointed at 3.6). Both
+    # replacements were verified with real completions against the
+    # actual TrendAnalyzer prompt shape before being pinned here, not
+    # just confirmed to exist — see docs/BUILD_LOG.md. gpt-oss-120b is a
+    # reasoning model: it spends some of `max_tokens` on a hidden
+    # `message.reasoning` field before the visible answer (e.g. 99 of
+    # 800 in that test), so completions can come back empty if
+    # max_tokens is set too tight for reasoning + answer both — verified
+    # comfortable headroom at the token budgets the current agents use
+    # (800-1000), but keep this in mind if a future agent sets a much
+    # smaller max_tokens.
+    PRIMARY_MODEL: str = "openai/gpt-oss-120b"
+    FALLBACK_MODEL: str = "gemini-3.6-flash"
 
     def __init__(self, db: AsyncSession, redis: RedisClient) -> None:
         self.db = db

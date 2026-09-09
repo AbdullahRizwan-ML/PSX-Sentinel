@@ -4265,3 +4265,269 @@ index ad8b80e..e3614b8 100644
          result: dict = {
              "bull_case": (
 ```
+
+## 2026-09-09 — Phase 6 Session 1: point-in-time context builder + feasibility probe
+
+Opens Phase 6 ("full-system Arbitrator backtest"). Every backtest run so far
+(Phase 5 Sessions 1 and 6) validated the raw XGBoost model in isolation,
+replayed from a static parquet file. Nobody had ever checked whether the
+*deployed conviction score* — all Arbitrator terms combined, as a real user
+would see it — correlates with forward returns, because nothing could
+reconstruct what the four agents would have seen if the pipeline had run on
+an arbitrary historical date T instead of today. This session builds and
+proves that one piece of infrastructure. It does NOT run the backtest itself.
+
+### Part 1 — the context builder (new package, not a rewrite of orchestrator.py)
+
+`backend/app/backtest/context_builder.py` — `PointInTimeContextBuilder`, a
+**parallel path** to `AnalysisOrchestrator._build_context`, not a
+modification of it (`orchestrator.py` is untouched — confirmed by `git diff`,
+see Part 5). Same `AgentContext` shape; every query bounded to
+`date <= T` instead of "today":
+
+- `recent_prices` — same `PRICE_WINDOW_DAYS` (600 calendar days) lookback as
+  production, anchored at T instead of `date.today()`.
+- `news_articles` — `published_at` bounded on BOTH sides now: `[T-30d, T]`
+  (production only has a lower bound, since "today" has no future to leak
+  from — a point-in-time context needs the upper bound too).
+- `announcements` — production has no bound at all (FilingSceptic just
+  takes the 10 most recent); this adds the upper bound `announced_at <= T`.
+- `sector_flows` — reused, not reimplemented: `NCCPL_SECTOR_MAP`,
+  `FLOW_LOOKBACK_DAYS`, `LIPI_RETAIL_TYPES`, and the actual `_SECTOR_FLOW_SQL`
+  text object are imported directly from `orchestrator.py` (module-level
+  constants, not private-method calls) and executed with `report_date=T` —
+  that SQL already parameterizes on `date <= :report_date`, so it was
+  point-in-time-safe by construction; reusing it means the sector mapping
+  and flow-window decisions can't drift between the two paths.
+- `ml_signal` — computed by calling `predict_from_prices` (Phase 3 Session 3)
+  over the already-T-bounded `recent_prices`. `build_features_point_in_time`
+  (Phase 5 Session 6) was already point-in-time safe by construction — reused
+  exactly as the live orchestrator uses it, not reimplemented, per the
+  session brief's explicit instruction.
+
+`build()` returns `(AgentContext, leakage_report)` and raises
+`ContextLeakageError` immediately if any row violates its bound — same
+fail-loud discipline as `backtest_xgboost.py`'s `assert_no_leakage`.
+
+### Part 2 — fundamentals: excluded, as scoped, not "fixed"
+
+`context.peer_fundamentals` is always left at its `{}` default.
+`docs/KNOWN_ISSUES.md` ("PSX Terminal fundamentals are a current snapshot —
+lookahead-bias risk for ML features", Phase 5 Session 5) already established
+that `company_fundamentals` holds one live-snapshot row per ticker with no
+history and no as-of dates beyond `scraped_at` — joining today's P/E onto a
+2025-12-01 backtest row would leak information from eight months in the
+future. Building true point-in-time fundamentals is possible in principle
+(PSX Terminal's `fyReports` payload has 20 fiscal years with per-FY
+`earnings_release_date`) but is separate, larger work, not a blocker for
+this session's context-construction infrastructure. With
+`peer_fundamentals == {}`, `Arbitrator._fundamentals_contribution` already
+has a defined path — an honest 0.0 with a logged skip reason, same
+discipline as every other term. **`KNOWN_ISSUES.md`'s fundamentals entry was
+deliberately left untouched this session, per the brief** — this works
+around the gap, it does not close it. It is a known, documented limitation
+of anything built on top of this module, not a silent one.
+
+### Part 3 — leakage-safety proof (measured, not claimed)
+
+A read-only smoke test (no LLM calls) ran `PointInTimeContextBuilder.build()`
+for all 15 probe pairs (see Part 6) before any agent was invoked. Every
+single pair returned `all_ok=True` across all 4 data types — sample:
+
+```
+PPL    2025-12-01  prices= 406 (max=2025-12-01) news= 0 (max=None) ann= 0 (max=None) flow_days=10 (max=2025-12-01) ml_avail=True ml_gate=False all_ok=True
+PPL    2026-06-10  prices= 410 (max=2026-06-10) news= 9 (max=2026-06-08) ann= 4 (max=2026-05-29) flow_days=10 (max=2026-06-10) ml_avail=True ml_gate=False all_ok=True
+PPL    2026-07-08  prices= 408 (max=2026-07-08) news= 1 (max=2026-06-08) ann= 9 (max=2026-07-03) flow_days=10 (max=2026-07-08) ml_avail=True ml_gate=False all_ok=True
+```
+
+The PPL 2026-07-08 row is worth calling out specifically: PPL has 21 total
+news rows in the DB (mostly clustered 2026-06 to 2026-07-17), but as-of
+2026-07-08 only 1 of them is visible (the 30-day window `[06-08, 07-08]`
+correctly excludes the later ones) — direct proof the upper bound is doing
+real work, not just a no-op given already-past data. `ml_gate=False`
+everywhere also cross-checks cleanly against the known live finding
+(KNOWN_ISSUES.md: max_prob cluster 0.357-0.467, always below the 0.55 gate)
+— the historical dates behave the same way production does today, as
+expected since it's the same model and a similar feature distribution.
+
+### Part 4 — unplanned discovery: both LLM models were dead (fixed, with sign-off)
+
+The first probe run (real LLM calls, per the brief — no mocking) failed
+**26/26** — every single call, both agents that should have skipped
+correctly did, but every real call errored identically:
+
+```
+Groq failed for trend_analyzer: Error code: 404 - {'error': {'message':
+"The model `llama-3.3-70b-versatile` does not exist or you do not have
+access to it.", ...}}. Trying Gemini fallback...
+BOTH LLMs failed for trend_analyzer. ... Gemini: 404 This model
+models/gemini-2.0-flash is no longer available. Please update your code
+to use models/gemini-3.6-flash for the latest features and improvements.
+```
+
+This is a **pre-existing, session-independent production outage** — nothing
+in `context_builder.py` caused it, and it would have failed identically on
+`orchestrator.py`'s own path. Both `LLMGateway.PRIMARY_MODEL`
+("llama-3.3-70b-versatile") and `.FALLBACK_MODEL` ("gemini-2.0-flash") went
+dead on the provider side sometime between Phase 5 Session 8 (2026-07-18)
+and today, silently — nothing in this codebase would have surfaced it until
+the next real agent call anywhere in the app.
+
+**Diagnosed, not guessed:** `GET https://api.groq.com/openai/v1/models`
+(live, with the real key) confirmed Groq's entire catalog has moved on —
+no `llama-3.x` model remains at all; the closest general-purpose chat
+options are `openai/gpt-oss-120b`/`-20b` (OpenAI's open-weight models,
+now hosted on Groq's infra) or `groq/compound` (an agentic/tool-use model,
+a worse fit for this project's plain single-turn prompts).
+`GET .../v1beta/models` on Gemini confirmed `gemini-2.0-flash` is gone;
+its own 404 pointed at `gemini-3.6-flash` directly.
+
+**Verified with real completions before proposing anything**, not just
+confirmed to exist:
+- A trivial "say OK" prompt against `gpt-oss-120b`/`-20b` at `max_tokens=20`
+  came back with `content=''` despite spending all 20 tokens — these are
+  **reasoning models**: `usage.completion_tokens_details.reasoning_tokens`
+  and a hidden `message.reasoning` field showed the model was still
+  "thinking" when it hit the token cap. At `max_tokens=300` both answered
+  cleanly (`content='OK'`).
+- The real risk this raises: would the agents' EXISTING `max_tokens` values
+  (800/1000/1000) survive the same truncation? Tested against
+  `TrendAnalyzer._build_prompt`'s actual output (not a hand-approximated
+  prompt) at `max_tokens=800`: `gpt-oss-120b` used 213 completion tokens
+  (99 reasoning + rest visible), `finish_reason='stop'` (not `'length'`),
+  parsed cleanly to `signal='BUY'` with a coherent 2-3 sentence rationale.
+  Comfortable headroom, not a near-miss.
+- Presented both findings — the outage and the verified fix — to Abdullah
+  via `AskUserQuestion` rather than unilaterally editing
+  "the most important file" in the project on my own judgment: fix now
+  with `gpt-oss-120b`, fix now with the smaller/faster `gpt-oss-20b`, or
+  leave it broken this session and report the probe as
+  infrastructure-proven-but-LLM-blocked. **Chose: fix now with
+  `gpt-oss-120b`.**
+
+**The fix** (full diff — two constants plus a WHY comment, not a rewrite):
+
+```diff
+     CIRCUIT_BREAKER_THRESHOLD: int = 3
+-    PRIMARY_MODEL: str = "llama-3.3-70b-versatile"
+-    FALLBACK_MODEL: str = "gemini-2.0-flash"
++    # Phase 6 Session 1 (2026-09-09): the previous pins
++    # (llama-3.3-70b-versatile / gemini-2.0-flash) both went dead
++    # between Phase 5 Session 8 (2026-07-18) and this session — Groq
++    # dropped the Llama chat lineup from its catalog entirely (confirmed
++    # via GET /openai/v1/models: no llama-3.x model remains), and Gemini
++    # 2.0 Flash was retired (its own 404 pointed at 3.6). Both
++    # replacements were verified with real completions against the
++    # actual TrendAnalyzer prompt shape before being pinned here, not
++    # just confirmed to exist — see docs/BUILD_LOG.md. gpt-oss-120b is a
++    # reasoning model: it spends some of `max_tokens` on a hidden
++    # `message.reasoning` field before the visible answer (e.g. 99 of
++    # 800 in that test), so completions can come back empty if
++    # max_tokens is set too tight for reasoning + answer both — verified
++    # comfortable headroom at the token budgets the current agents use
++    # (800-1000), but keep this in mind if a future agent sets a much
++    # smaller max_tokens.
++    PRIMARY_MODEL: str = "openai/gpt-oss-120b"
++    FALLBACK_MODEL: str = "gemini-3.6-flash"
+```
+
+`llm_gateway.py` is not on this session's protected-file list (that list was
+`orchestrator.py`/`arbitrator.py`/`trend_analyzer.py`/`news_synthesizer.py`/
+`filing_skeptic.py`) but is called out elsewhere in `CLAUDE.md` as "the most
+important file" / non-negotiable, so it's flagged here prominently rather
+than buried: this was an unplanned, out-of-session-scope fix, made only
+after live diagnosis, live re-verification, and explicit user sign-off — not
+a silent side effect.
+
+### Part 5 — probe re-run: 26/26 real LLM calls succeeded
+
+Same 15 pairs, same code, only the two model constants changed. Full
+results:
+
+| agent | LLM calls | skipped | failed | tokens | avg latency |
+|---|---|---|---|---|---|
+| trend_analyzer | 15/15 | 0 | 0 | 7,623 | 1,882ms |
+| news_synthesizer | 2/15 | 13 | 0 | 1,229 | 1,031ms |
+| filing_skeptic | 9/15 | 6 | 0 | 16,036 | 7,925ms |
+| **TOTAL** | **26/45 (58%)** | | **0** | **24,888** | |
+
+`trend_analyzer` fires every time (full price history exists for every T in
+the test window). `news_synthesizer` and `filing_skeptic` skip often for
+earlier T — this is the honest, expected shape: announcements and news are
+rolling ~10-per-ticker mirrors captured in mid-2026 (see KNOWN_ISSUES.md),
+not historical archives, so most of the test window (2025-11-27 onward)
+predates anything that still exists in the DB today. This is real, useful
+feasibility signal for Session 2, not a bug — a full historical backtest
+will get FilingSceptic/NewsSynthesizer signal only for the most recent
+slice of any date range it samples.
+
+Cross-checked, not just trusted: `llm_calls` queried independently
+(`WHERE analysis_id IS NULL AND called_at >= <run start>`) after the run
+returned exactly 26 rows / 24,888 tokens / `status='SUCCESS'` ×26 — an exact
+match against the in-process `AgentResult` bookkeeping. All 26 calls
+succeeded on Groq primary; the Gemini fallback path was never exercised
+(0 fallback calls), so `gemini-3.6-flash` is verified reachable and correct
+but not exercised under real failover load this session.
+
+filing_skeptic's latency is notably higher (up to 19.3s on one MCB call) —
+expected, its prompts carry the full multi-document text batch (up to a
+9,000-char budget, Phase 5 Session 7), the heaviest prompt of the three.
+
+Leakage re-checked on this run too: 15/15 `all_ok=True`, identical to the
+smoke test in Part 3 (same code path, LLM success/failure doesn't touch
+context construction).
+
+### Part 6 — probe design + cost/time extrapolation for Session 2
+
+Tickers: **PPL, MCB, LUCK** — deliberately chosen to span all three sectors
+`NCCPL_SECTOR_MAP` actually covers (Oil & Gas, Banking, Cement), so
+`sector_flows` gets real mapped data on every pair even though none of the
+three probed agents read it (only a future Arbitrator-running session
+would). Dates: **2025-12-01, 2026-02-01, 2026-04-15, 2026-06-10, 2026-07-08**
+— spread across the shared ML test window (2025-11-27 → 2026-07-10),
+reconfirmed live against `ml_data/test.parquet` before picking them (not
+assumed from a prior session's doc claim, though it matched exactly). Not
+cherry-picked for "interesting" results — chosen for even spread, and the
+resulting mix of starved-early / fed-later pairs turned out to be the
+realistic and informative shape on its own.
+
+Extrapolating this probe's actual rate (10.22s/pair wall-clock, 1.73 LLM
+calls/pair, 957 tokens/real call — NOT an assumed 3-calls-always rate):
+
+| Session 2 sample size | est. wall-clock | est. LLM calls | est. tokens |
+|---|---|---|---|
+| 10 tickers × 152 dates (every trading day in the test window) | ~259 min (~4.3h) | ~2,635 | ~2.52M |
+| 10 tickers × 50 dates (~1-in-3 sampling) | ~85 min | ~867 | ~830K |
+| 10 tickers × 20 dates (coarse, ~monthly) | ~34 min | ~347 | ~332K |
+
+Caveat stated plainly: this probe's skip rate is specific to PPL/MCB/LUCK
+and these 5 dates. A real Session 2 run sampling further back or across
+more tickers will skew MORE toward skipped news/filing calls — these
+mirror windows are only ~2-3 months deep as of this session — so the table
+above is upper-bound-ish for LLM cost, not a tight prediction.
+TrendAnalyzer's ~100% call rate is the reliable floor; treat the other two
+agents' contribution to any total as reducible, not fixed.
+
+**Recommendation for Session 2 sizing:** the 20-dates-per-ticker row
+(~34 min, ~347 calls) is a reasonable first full-Arbitrator run — enough
+spread to see the score vary across regimes without a multi-hour commitment
+sight-unseen. The 152-dates-per-ticker (full daily resolution) run is
+better scoped as a deliberate later step once the first run's numbers are
+sanity-checked, given the ~4.3-hour estimate.
+
+### Part 7 — scope confirmation
+
+`git diff --name-only` confirms `orchestrator.py`, `arbitrator.py`,
+`trend_analyzer.py`, `news_synthesizer.py`, `filing_skeptic.py` are
+untouched this session. Production-code changes are exactly: the new
+`backend/app/backtest/` package (2 files), the new
+`backend/scripts/probe_point_in_time_context.py`, the two-constant
+`llm_gateway.py` fix (Part 4), and one `.gitignore` line
+(`backend/phase6_*.json`, following the existing `verify_*.py --save`
+snapshot convention). `docs/KNOWN_ISSUES.md`'s fundamentals entry was left
+untouched per the brief (Part 2). Raw probe output saved to
+`backend/phase6_session1_probe.json` (gitignored, per convention — this
+Build Log entry carries the numbers).
+
+**End of session: local `main` pushed, HEAD == origin/main** (see the push
+immediately following this commit).
