@@ -4694,3 +4694,121 @@ for "Redis"/"Upstash" — zero matches, so nothing there claimed Redis was
 working and nothing needed correcting; left untouched per the brief.
 
 **End of hotfix: local `main` pushed, HEAD == origin/main.**
+
+## 2026-09-10 — Phase 6 Session 2: real point-in-time conviction scores vs forward returns
+
+First time the **deployed composite conviction score** — not the raw
+XGBoost model alone — has ever been checked against what the stock did
+next. Session 1 built the point-in-time machinery; this session used it
+for real across the full universe and asked the question Phase 6 opened
+with. Full numbers in `docs/BACKTEST_RESULTS.md` (new top section); this
+entry records the decisions and the cost.
+
+**Headline: no detectable relationship. Pearson r = −0.0252, p = 0.723,
+95% CI [−0.163, +0.114], n = 200.** Terciles run mildly backwards (low
++0.751%, mid +0.618%, high +0.521%) but the 0.23pp spread sits far inside
+a 4.83% forward-return sd. The honest read is "this shows nothing", not
+"the score is inverted" — and a null was a realistic outcome given the
+terms involved (see the doc's honest-reading section).
+
+### The score/narrative separability decision (read-first item)
+
+`arbitrator.py` splits cleanly: `_fundamentals_contribution`,
+`_flow_contribution`, `_calculate_score`, `_score_to_label` and
+`_build_score_breakdown` all run **before** `_build_prompt` /
+`self.llm.complete()`, and nothing in the score path consumes the LLM
+response — it feeds only `bull_case`/`bear_case`/`risk_factors`. So the
+new script calls those methods directly on a real `Arbitrator` instance
+and never calls `run()`. The scoring arithmetic is used **verbatim, not
+reimplemented**, so the number matches what production serves. **No
+protected file was edited** to achieve this — it is a pure call-site
+decision. Proven rather than asserted: `llm_calls` queried for
+`agent_name='arbitrator'` across the run window returned **0 rows**.
+This saved 200 LLM calls and is what kept the run inside budget.
+
+### What was built
+
+`backend/scripts/backtest_conviction_scores.py` — per (ticker, date):
+build the T-bounded context via `PointInTimeContextBuilder` (reused
+as-is, unmodified), run the three agents for real, compute the
+Arbitrator score deterministically, pull the realized forward
+5-trading-day return (reusing `HORIZON_DAYS` and the
+`(fwd − close)/close` formula from `app/ml/features.py`, on
+split-adjusted prices — all three known splits predate the window, so the
+adjustment is a no-op inside it, verified and printed). Saves after every
+pair and skips already-saved pairs, so it is crash-safe and resumable;
+`--limit`/`--start` run tranches, `--analyze` re-runs stats only.
+
+**Hard rule honored: nothing was written to `intelligence_reports`.**
+These are synthetic scores on pretend-historical "today"s and would
+corrupt data a real user could see. The only DB writes are `llm_calls`
+audit rows — genuine records of real API calls, `analysis_id` NULL.
+Raw output: `backend/phase6_session2_scores.json` (gitignored via the
+existing `backend/phase6_*.json` pattern).
+
+### Sample
+
+10 active tickers × 20 evenly spaced calendar dates = 200 pairs. Window
+**re-read live from `ml_data/test.parquet`** rather than trusting Session
+1's numbers — it independently reconfirmed **2025-11-27 → 2026-07-10**
+and the same 10 tickers. **Leakage: 0 failures / 200 pairs.**
+
+### Real cost vs Session 1's estimate — and a ceiling nobody had modelled
+
+Ran as a 10-pair tranche first (per the brief's "don't burn 200 pairs on
+an estimate you already know is wrong" rule), checked the rate, and
+continued only after it came in **under** budget.
+
+| | Session 1 estimate | Actual |
+|---|---|---|
+| LLM calls (3 agents) | ~347 | **233** |
+| Tokens | ~331,840 | **203,354** |
+| Wall clock | ~34 min | **~30 min** |
+
+Per-agent: `trend_analyzer` 150, `filing_skeptic` 59, `news_synthesizer`
+4, `arbitrator` 0. Fewer calls than projected because Session 1's
+1.73 calls/pair came from PPL/MCB/LUCK; across all 10 tickers the
+news/filing skip rate is higher.
+
+**But the real binding constraint turned out to be one Session 1 never
+modelled: Groq's free tier caps at 200,000 tokens/day, and this run
+exhausted it** (`Limit 200000, Used 199733`). Consequences, all handled
+gracefully and all visible: 26 Groq 429s → **17 rescued by the Gemini
+fallback** (`gemini-3.6-flash` — the 2026-09-09 hotfix earning its keep
+on its first real outage), 8 failed on both providers, and the circuit
+breaker — live again only because of the 2026-09-09 Redis restore —
+rejected 46 further calls. **At ~1,000 tokens/pair the free tier caps a
+run at ~200 pairs/day**; a bigger backtest needs multiple days, a
+deliberate Gemini route, or a paid tier. That is the number Session 3
+should size against, not the token total.
+
+### Data-quality caveat, quantified rather than waved at
+
+26 of 200 pairs had at least one agent fail, concentrated entirely in
+**UBL (all 20) and PSO (6)** — the alphabetically-last tickers, reached
+when the budget ran out. A failed agent contributes an honest 0.0, biasing
+those scores toward 50. Re-ran the correlation on the **clean 174-pair
+subset: r = −0.0214, p = 0.779** — materially identical to the full
+sample, so **the conclusion is robust to the degradation**. Noted in the
+doc that n=174 is really 9 tickers plus a partial PSO, not a clean
+10-ticker sample.
+
+### Two findings worth carrying forward
+
+- **`news_contribution` fired on 0 of 200 pairs.** Structural, not a bug:
+  `news_articles` is a rolling recent-only mirror (PPL/PSO/OGDC, June 2026
+  onward), so the news term is dead in any backtest over this window.
+- **The ML gate passed on 15/200 pairs (7.5%), `max_prob` up to 0.764.**
+  `docs/KNOWN_ISSUES.md` records that the gate never clears in production
+  (latest-day cluster 0.348–0.467); this run reproduces that low end
+  (min 0.348) but shows the gate **is** historically reachable — rarely
+  firing, not structurally unreachable. KNOWN_ISSUES not edited this
+  session; flagging it here for whoever revisits that entry.
+
+**Scope:** no agent/orchestrator/scoring file edited (`git diff` confirms
+`arbitrator.py`, `orchestrator.py`, `trend_analyzer.py`,
+`news_synthesizer.py`, `filing_skeptic.py`, and Session 1's
+`context_builder.py` are all untouched). New script + two doc sections
+only.
+
+**End of session: local `main` pushed, HEAD == origin/main.**

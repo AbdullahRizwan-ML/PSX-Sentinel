@@ -10,6 +10,159 @@
 
 ---
 
+## Phase 6 Session 2 — composite conviction score vs forward returns, first-ever check (2026-09-10)
+
+**One-line answer:** across 200 point-in-time (ticker, date) pairs, the
+deployed composite conviction score showed **no detectable relationship
+with forward 5-day returns — Pearson r = −0.025, p = 0.72, 95% CI
+[−0.163, +0.114]**. The tercile means run mildly *backwards* (low-score
+pairs +0.751%, high-score +0.521%), but the 0.23pp spread is far inside
+the noise of a 4.83% forward-return standard deviation. **The honest read
+is "this shows nothing", not "this shows the score is inverted."**
+
+**What is different about this run:** every previous backtest in this doc
+tested the *raw XGBoost model alone*, replayed from a static parquet. This
+is the first time the **composite score a user actually sees** — technical
++ news + filing + ML + flow, as computed by the live `Arbitrator` — has
+been checked against what the stock did next. Reproduce with
+`python backend/scripts/backtest_conviction_scores.py`.
+
+### ⚠️ Scope limitation, stated up front: this is a FIVE-term score, not the six-term one production serves
+
+`peer_fundamentals` is deliberately passed empty, so
+`fundamentals_contribution` is an honest **0.0 on all 200 pairs**.
+`company_fundamentals` is a current-snapshot table with no history
+(docs/KNOWN_ISSUES.md, Phase 5 Session 5) — joining today's P/E onto a
+2025-12 row would be lookahead bias. **So this result does not test the
+score the live system actually serves; it tests that score minus its
+fundamentals term.** Building point-in-time fundamentals is separate,
+larger work (PSX Terminal's `fyReports` carries per-FY
+`earnings_release_date`), not done here.
+
+### Setup
+
+| | |
+|---|---|
+| Sample | 10 active tickers × 20 dates = **200 pairs** |
+| Dates | 20 evenly spaced calendar dates, 2025-11-27 → 2026-07-10 |
+| Window source | shared ML test window, re-read live from `ml_data/test.parquet` |
+| Context | `PointInTimeContextBuilder` (Phase 6 Session 1), every row bounded `date <= T` |
+| Agents | `TrendAnalyzer`, `NewsSynthesizer`, `FilingSceptic` — real LLM calls, no mocking |
+| Score | `Arbitrator`'s own scoring methods, called verbatim |
+| Outcome | realized forward 5-trading-day return, `HORIZON_DAYS` + formula reused from `app/ml/features.py`, split-adjusted |
+| Leakage | **0 failures / 200** — every pair's prices, news, announcements and flows re-verified in Python against the rows actually returned |
+| DB writes | **no `intelligence_reports` rows** (hard rule — these are synthetic scores on pretend-historical "today"s). `llm_calls` audit rows only, `analysis_id` NULL |
+
+**The Arbitrator's narrative LLM call was skipped**, and that is sound:
+`arbitrator.py` computes the score deterministically
+(`_fundamentals_contribution`, `_flow_contribution`, `_calculate_score`,
+`_score_to_label`, `_build_score_breakdown`) *before* `_build_prompt` /
+`self.llm.complete()`, and the LLM response feeds only bull/bear prose.
+The score arithmetic is used verbatim, not reimplemented. Proven, not
+asserted: `llm_calls` was queried for `agent_name='arbitrator'` over the
+run window and returned **0 rows**.
+
+### Result — correlation and terciles
+
+| subset | n | Pearson r | p | 95% CI | low tercile | mid | high |
+|---|---|---|---|---|---|---|---|
+| All pairs | 200 | **−0.0252** | 0.723 | [−0.163, +0.114] | +0.751% | +0.618% | +0.521% |
+| Clean only (no agent failure) | 174 | **−0.0214** | 0.779 | [−0.170, +0.128] | +0.792% | +0.601% | +0.491% |
+
+Conviction scores ranged 19.0 → 68.5 (mean 51.03, sd 9.67, 95 distinct
+values). Forward returns: mean **+0.629%**, sd 4.83%, 54.5% positive —
+this window was broadly bullish, consistent with the Session 6 finding
+that the test tail is a strongly bullish period.
+
+Per-ticker correlations (n=20 each) spread −0.350 (MCB) to +0.281 (MEBL),
+mean −0.021. At n=20 a single r needs roughly |r| > 0.44 to clear 95%
+significance, so **every one of those is consistent with zero** — the
+spread is what pure noise across 10 tickers looks like, and no individual
+ticker is being claimed as a finding here.
+
+### Which terms actually moved the score
+
+This is the real story behind a null correlation — reported from the data,
+not asserted:
+
+| term | % of pairs non-zero | min | max | sd |
+|---|---|---|---|---|
+| `flow_contribution` | **90.0%** | −10.00 | +10.00 | 4.87 |
+| `technical_contribution` | **72.0%** | −17.00 | +17.00 | 6.94 |
+| `ml_contribution` | 7.5% | 0.00 | +5.00 | 1.32 |
+| `filing_contribution` | 4.5% | −15.00 | 0.00 | 2.43 |
+| `news_contribution` | **0.0%** | 0.00 | 0.00 | 0.00 |
+| `fundamentals_contribution` | 0.0% (excluded by design) | 0.00 | 0.00 | 0.00 |
+
+So the composite under test is, in practice, **technical + sector flow**,
+with occasional ML and filing input. Two things follow:
+
+- **`news_contribution` fired on literally zero of 200 pairs.** Not a bug
+  — `news_articles` is a rolling recent-only mirror (only PPL/PSO/OGDC
+  ever matched, only from June 2026), so for nearly the whole historical
+  window there is no news to analyse, and where there was,
+  `NewsSynthesizer` judged nothing relevant. The news term is structurally
+  dead in any backtest over this window.
+- **The ML gate passed on 15/200 pairs (7.5%), with `max_prob` reaching
+  0.764.** This is genuinely new: `docs/KNOWN_ISSUES.md` records that in
+  production the gate *never* clears (latest-day cluster 0.348–0.467), and
+  this run reproduces that low end (min 0.348) — but historically the gate
+  *was* reachable. The gate is rarely-firing, not structurally unreachable.
+
+### Data-quality caveat — Groq's daily token cap degraded 26 pairs
+
+Partway through, the run exhausted **Groq's free-tier 200,000 tokens-per-day
+limit** (`Limit 200000, Used 199733`). After that: 26 Groq calls returned
+429, **17 were rescued by the Gemini fallback** (`gemini-3.6-flash` — fixed
+in the 2026-09-09 hotfix, earning its keep on its first real outage), 8
+failed on both providers, and the circuit breaker — live again after the
+2026-09-09 Redis restore — rejected 46 further calls.
+
+Effect: **26 of 200 pairs** had at least one agent fail, so those agents
+contributed 0.0 and biased those scores toward 50. The damage is confined
+to **UBL (all 20 pairs) and PSO (6)** — the alphabetically-last tickers,
+reached when the budget ran out. Because a failed agent's contribution is
+an honest zero rather than a wrong number, and because the clean-subset
+correlation (−0.0214) is materially identical to the full-sample one
+(−0.0252), **the conclusion is robust to this degradation** — but UBL is
+effectively absent from the clean subset and that should be remembered
+before treating n=174 as a clean 10-ticker sample. It is 9 tickers plus a
+partial PSO.
+
+**Operational consequence for future sizing:** at ~1,000 tokens/pair, the
+Groq free tier caps a run at roughly **200 pairs per day**. A larger
+backtest must span multiple days, deliberately route to Gemini, or move off
+the free tier. Session 1's cost estimate (~347 calls / ~332K tokens for 200
+pairs) was *over* on tokens — actual was **233 calls / 203,354 tokens /
+~30 min** — but it never modelled a daily ceiling, which turned out to be
+the real binding constraint.
+
+### Honest reading of the result
+
+- **The question this phase opened with now has a first answer, and the
+  answer is "no measurable edge."** r = −0.025 at n=200 is
+  indistinguishable from zero. Nothing here says the score is inverted;
+  nothing says it works.
+- **This is a sanity check, not a powerful test.** 200 points, one
+  ~7.5-month window, one broadly bullish regime, 5-day horizon only, no
+  transaction costs, no trading rule — this measures association, not
+  profitability. The Sharpe/drawdown machinery used in the Session 1/6
+  model backtests was deliberately not applied to a score with no
+  demonstrated signal.
+- **A null result was a realistic outcome given what the terms are.** The
+  two live terms are a technical read (whose underlying ML cousin scores
+  ~43% on 3-class direction) and a *sector-level* flow regime whose own
+  Session 8 exploration measured only ~+0.05 correlation with forward
+  sector returns. A composite of two weak, partly-sector-level signals
+  showing ~0 correlation at n=200 is consistent with what was already
+  documented — it is not a new failure.
+- **What this does not rule out:** the missing fundamentals term, a
+  different horizon, a non-linear or regime-conditional relationship, or
+  score *changes* rather than score *levels*. Those are open, and this run
+  is not evidence against them.
+
+---
+
 ## Phase 5 Session 6 — retrained model (full-depth window, ENGROH universe), backtest re-run (2026-07-18)
 
 **One-line answer:** the retrained model (same 11 features, same
