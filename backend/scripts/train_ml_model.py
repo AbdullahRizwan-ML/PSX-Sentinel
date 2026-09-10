@@ -19,12 +19,26 @@ Reproducibility:
     and the shuffle on training data (we do NOT shuffle val or test,
     those stay in chronological row order).
 
-Usage (from backend/ with .venv active):
+Phase 7 Session 1 — feature-set switch:
+    `--features base` (default) trains the 11-column production set and
+    writes ml_data/model.json, exactly as before. `--features extended`
+    trains the same architecture on those 11 columns PLUS the two
+    experimental sector-flow columns, and MUST be pointed at a
+    different artifact via --model-out. The production artifact is
+    never silently replaced by a model whose input shape the live
+    inference path (app/ml/inference.py builds an 11-value vector from
+    prices alone) cannot produce.
+
+Usage (from backend/ with venv active):
     python scripts/train_ml_model.py
+    python scripts/train_ml_model.py --features extended \
+        --model-out ml_data/model_flow.json \
+        --metrics-out ml_data/metrics_flow.json
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -43,12 +57,20 @@ from sklearn.metrics import (  # noqa: E402
     confusion_matrix,
 )
 
-from app.ml.features import FEATURE_COLUMNS  # noqa: E402
+from app.ml.features import (  # noqa: E402
+    EXTENDED_FEATURE_COLUMNS,
+    FEATURE_COLUMNS,
+)
 
 RANDOM_SEED = 42
 ML_DATA = Path(__file__).resolve().parent.parent / "ml_data"
 MODEL_PATH = ML_DATA / "model.json"
 METRICS_PATH = ML_DATA / "metrics.json"
+
+FEATURE_SETS = {
+    "base": FEATURE_COLUMNS,
+    "extended": EXTENDED_FEATURE_COLUMNS,
+}
 
 # UP / DOWN / FLAT, fixed order — must match downstream inference code.
 LABEL_TO_INT = {"DOWN": 0, "FLAT": 1, "UP": 2}
@@ -65,9 +87,17 @@ def _load_split(name: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def _xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+def _xy(
+    df: pd.DataFrame, feature_columns: list[str]
+) -> tuple[np.ndarray, np.ndarray]:
     """Extract feature matrix and integer label vector."""
-    x = df[FEATURE_COLUMNS].astype(float).to_numpy()
+    missing = [c for c in feature_columns if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Split is missing feature column(s) {missing} - rebuild "
+            f"with scripts/build_ml_dataset.py."
+        )
+    x = df[feature_columns].astype(float).to_numpy()
     y = df["label"].map(LABEL_TO_INT).to_numpy()
     if np.isnan(x).any():
         raise ValueError(
@@ -78,6 +108,32 @@ def _xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--features",
+        choices=sorted(FEATURE_SETS),
+        default="base",
+        help="'base' = the 11 production columns (default); 'extended' "
+             "= those plus the Phase 7 S1 sector-flow columns",
+    )
+    ap.add_argument("--model-out", default=None)
+    ap.add_argument("--metrics-out", default=None)
+    args = ap.parse_args()
+
+    feature_columns = FEATURE_SETS[args.features]
+    model_path = Path(args.model_out) if args.model_out else MODEL_PATH
+    metrics_path = (
+        Path(args.metrics_out) if args.metrics_out else METRICS_PATH
+    )
+    if args.features != "base" and model_path == MODEL_PATH:
+        raise SystemExit(
+            "Refusing to overwrite ml_data/model.json with a "
+            f"'{args.features}' model: app/ml/inference.py feeds it an "
+            f"{len(FEATURE_COLUMNS)}-value vector built from prices "
+            "alone and cannot supply the extra columns. Pass "
+            "--model-out with a different path."
+        )
+
     np.random.seed(RANDOM_SEED)
 
     train_df = _load_split("train")
@@ -86,7 +142,11 @@ def main() -> None:
 
     print(f"Loaded: train={len(train_df):,}  "
           f"val={len(val_df):,}  test={len(test_df):,}")
-    print(f"Feature columns ({len(FEATURE_COLUMNS)}): {FEATURE_COLUMNS}")
+    print(f"Feature set: '{args.features}' "
+          f"({len(feature_columns)} columns)")
+    print(f"Feature columns: {feature_columns}")
+    print(f"Model out:   {model_path}")
+    print(f"Metrics out: {metrics_path}")
     print(f"Random seed: {RANDOM_SEED}")
     print()
 
@@ -95,9 +155,9 @@ def main() -> None:
         frac=1.0, random_state=RANDOM_SEED
     ).reset_index(drop=True)
 
-    x_tr, y_tr = _xy(train_df)
-    x_va, y_va = _xy(val_df)
-    x_te, y_te = _xy(test_df)
+    x_tr, y_tr = _xy(train_df, feature_columns)
+    x_va, y_va = _xy(val_df, feature_columns)
+    x_te, y_te = _xy(test_df, feature_columns)
 
     model = xgb.XGBClassifier(
         objective="multi:softprob",
@@ -147,7 +207,11 @@ def main() -> None:
     print("=" * 78)
     print("TEST-SET METRICS (final reported, never used for tuning)")
     print("=" * 78)
+    naive_up = float((y_te == LABEL_TO_INT["UP"]).mean())
     print(f"Accuracy: {acc:.4f}  (random-chance baseline = 0.3333)")
+    print(f"Always-UP naive baseline on this test set: {naive_up:.4f}  "
+          f"-> model is {'ABOVE' if acc > naive_up else 'BELOW'} it "
+          f"({(acc - naive_up) * 100:+.2f}pp)")
     print()
     print(
         classification_report(
@@ -183,7 +247,7 @@ def main() -> None:
 
     print("Feature importances (gain):")
     importances = sorted(
-        zip(FEATURE_COLUMNS, model.feature_importances_.tolist()),
+        zip(feature_columns, model.feature_importances_.tolist()),
         key=lambda kv: kv[1],
         reverse=True,
     )
@@ -192,27 +256,29 @@ def main() -> None:
         print(f"  {name:<18} {gain:6.4f}  {bar}")
     print()
 
-    model.save_model(str(MODEL_PATH))
-    print(f"Saved trained model -> {MODEL_PATH}")
+    model.save_model(str(model_path))
+    print(f"Saved trained model -> {model_path}")
 
     metrics = {
         "random_seed": RANDOM_SEED,
+        "feature_set": args.features,
         "best_iteration": int(best_iter),
         "n_train": int(len(train_df)),
         "n_val": int(len(val_df)),
         "n_test": int(len(test_df)),
-        "feature_columns": FEATURE_COLUMNS,
+        "feature_columns": feature_columns,
         "class_names": CLASS_NAMES,
         "test_accuracy": float(acc),
+        "test_accuracy_naive_always_up": naive_up,
         "test_classification_report": report_dict,
         "test_confusion_matrix": cm.tolist(),
         "feature_importances": [
             {"feature": n, "importance": float(g)} for n, g in importances
         ],
     }
-    with open(METRICS_PATH, "w", encoding="utf-8") as f:
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
-    print(f"Saved metrics       -> {METRICS_PATH}")
+    print(f"Saved metrics       -> {metrics_path}")
 
 
 if __name__ == "__main__":

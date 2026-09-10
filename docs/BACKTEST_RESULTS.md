@@ -10,6 +10,279 @@
 
 ---
 
+## Phase 7 Session 1 — sector FIPI/LIPI flow as an ML feature: retrain + backtest (2026-09-10)
+
+**One-line answer:** giving the model the sector institutional-flow
+imbalance ratio (plus a `flow_available` flag) **did not help — it very
+slightly hurt.** Test accuracy fell **43.19% → 42.26%** and the ungated
+sleeve return fell **+18.36% → +15.41%** (Sharpe 1.12 → 0.99) on the
+identical test window. The drop is not statistically significant
+(McNemar p = 0.19) and sits inside seed noise, so the honest verdict is
+**"does nothing, if anything mildly negative"** — but the direction is
+consistent: across 7 seeds the flow model won **1 of 7**, mean delta
+**−0.52pp**. The mechanism is visible and worth recording: the feature
+carries a **strong relationship in the training period that inverts in
+the test period**, so the model learns something real that then stops
+being true.
+
+### Scope — what this session tested and what it did NOT
+
+| | |
+|---|---|
+| Tested | Two extra features: `sector_flow_ratio` (raw Σnet/Σgross over the last ≤10 flow trading days for the ticker's mapped NCCPL sector(s)) and `flow_available` (0/1) |
+| Not tested | News, filing, and fundamentals terms — still excluded. News is a rolling recent-only mirror (structurally dead over this window, Phase 6 Session 2); `company_fundamentals` is a current-snapshot table with no history, so a historical join would be lookahead bias (Phase 6 Session 1). **This session did not attempt to close either gap** |
+| Not touched | `arbitrator.py`. Nothing was wired into production scoring — the flow term keeps its hand-picked ±10 mapping. This validates the idea first, the same build → evaluate → gate-and-wire sequence the original ML model went through over three sessions |
+| Production artifact | `ml_data/model.json` **deliberately left in place.** A 13-feature model cannot be served by the live path — `app/ml/inference.py` builds an 11-value vector from prices alone — so swapping it in would have been a silent production break, not an experiment. The trainer now refuses that overwrite outright. New artifact: `model_flow_phase7s1.json` |
+| LLM calls | **Zero.** Both new features are pure numbers; nothing here needs an agent |
+
+### The comparison is genuinely one-variable
+
+The dataset was rebuilt from the live DB, and the rebuild is provably a
+pure superset of the Session 6 one:
+
+| Check | Result |
+|---|---|
+| Row counts | 10,050 labeled (train 7,034 / val 1,504 / test 1,512) — identical to Session 6 |
+| 16 base columns (date/ticker/close + 11 features + forward return + label) | **Byte-identical** to the pre-rebuild parquet (`pandas.testing.assert_frame_equal`, `check_exact=True`) on all three splits |
+| Added columns | 2 features + 4 audit columns, nothing removed |
+| Per-ticker split boundaries | Identical to Session 6 for all 10 tickers; `train_max < val_min < val_max < test_min` holds for all 10 |
+| Control retrain (11 features, same rebuilt data, seed=42) | **43.19%, best iteration 34 — reproduces the Session 6 model exactly, and the saved artifact is SHA-256-identical to production `model.json`** |
+
+That last row matters: the control isn't "close to" the documented
+baseline, it *is* the baseline, bit for bit. So every difference reported
+below is attributable to the two added columns and nothing else.
+
+### Point-in-time safety — proven, not asserted
+
+The builder fetches each sector's full flow series once and slices the
+per-row 10-day window in pandas (~10,000 per-row SQL round trips would be
+unusable). That shortcut was verified rather than trusted, by
+`backend/scripts/verify_flow_features.py`:
+
+| Check | Result |
+|---|---|
+| Per-row SQL equivalence — re-ran production `AnalysisOrchestrator._SECTOR_FLOW_SQL` with `report_date` = that row's own date, recomputed the ratio and gate from the returned rows | **60/60 exact match** (tolerance 1e-12) |
+| Per-row point-in-time — every flow date the SQL returned is ≤ the row's date, asserted against the returned rows, not inferred from the `WHERE` clause | **60/60** |
+| Whole-dataset point-in-time — every row's recorded `flow_window_end` ≤ its own date | **0 violations of 9,086 windowed rows** |
+| Max staleness observed | **0 days** — every labeled row date has a same-day flow row, so the 14-day staleness gate never fired inside the dataset |
+
+The feature reuses production's constants verbatim
+(`NCCPL_SECTOR_MAP`, `FLOW_LOOKBACK_DAYS`, `LIPI_RETAIL_TYPES`,
+`_SECTOR_FLOW_SQL`, `Arbitrator.FLOW_MIN_DAYS/FLOW_STALE_DAYS`) — the
+sector mapping and flow-window math were not re-derived.
+
+### Before/after — model accuracy (same 1,512 test rows, 2025-11-27 → 2026-07-10)
+
+| Metric | Base (11 features) | Extended (13 features) | Δ |
+|---|---:|---:|---:|
+| **Test accuracy** | **43.19%** | **42.26%** | **−0.93pp** |
+| Always-UP naive baseline | 40.81% | 40.81% | — |
+| vs naive baseline | +2.38pp | +1.46pp | −0.92pp |
+| Random-chance baseline | 33.33% | 33.33% | — |
+| Best iteration (early stop on val) | 34 | 33 | — |
+| DOWN recall | 0.2013 | 0.1914 | −0.010 |
+| UP recall | 0.8590 | 0.8395 | −0.020 |
+| FLAT predictions (of 1,512) | 3 | 12 | +9 |
+| UP share of predictions | 82.1% | 81.5% | — |
+
+Hyperparameters, seed, split, and early-stopping rule are identical; only
+the feature matrix differs.
+
+### Feature importance of the two new columns
+
+| Rank (of 13) | Feature | Gain |
+|---:|---|---:|
+| 1 | `price_vs_ma20` | 0.1023 |
+| **2** | **`flow_available`** | **0.0895** |
+| 3 | `position_52w` | 0.0858 |
+| 4 | `rsi_14` | 0.0786 |
+| 5 | `return_3m` | 0.0782 |
+| 6 | `volume_vs_avg20` | 0.0763 |
+| 7 | `price_vs_ma50` | 0.0753 |
+| **8** | **`sector_flow_ratio`** | **0.0746** |
+| 9–13 | `ma_50`, `volatility_20d`, `ma_20`, `return_1w`, `return_1m` | 0.0637–0.0704 |
+
+**This is not the "near-zero importance" outcome.** The model spent 16.4%
+of its total gain on the two new columns — it used them heavily — and
+still came out slightly *worse*. That combination (high in-sample
+importance, no out-of-sample gain) is the signature of a feature whose
+relationship does not hold forward, which the next section confirms
+directly.
+
+Two caveats on that importance number:
+
+1. **`flow_available` is a perfect ENGROH indicator in this dataset**, not
+   a general "no data" flag. Flow coverage is 100% for all 9 mapped
+   tickers (9,086 rows) and 0% for ENGROH (964 rows, sector "Investment
+   Companies" is deliberately unmapped from NCCPL). So its #2 gain rank
+   is ambiguous between "this row has no flow reading" and "this row is
+   ENGROH" — the model may simply have found a ticker dummy. Excluding
+   ENGROH's rows entirely, the extended model is still worse (see below),
+   so this does not rescue the result.
+2. **There are only 3 distinct flow series across 10 tickers.** NCCPL's
+   finest granularity is sector level, never per-ticker, so
+   HBL/MCB/MEBL/UBL share one identical series, MARI/OGDC/PPL/PSO share a
+   second, LUCK has a third, and ENGROH has none. The 9,086 rows carrying
+   this feature are ~3 independent time series, not 9 — the effective
+   sample for learning it is far smaller than the row count suggests.
+
+### Is the −0.93pp real, or noise?
+
+| Test | Result |
+|---|---|
+| **McNemar exact test** (seed=42 pair, same test rows): 57 rows base-right/ext-wrong vs 43 base-wrong/ext-right, 100 discordant | **p = 0.1933 — not significant** |
+| **7 seeds, paired** (42, 0, 1, 2, 3, 7, 13) | base mean **43.43%** (sd 0.58pp), extended mean **42.91%** (sd 0.68pp), mean delta **−0.52pp** (sd 0.71pp), extended wins **1/7** |
+| **Rows with `flow_available == 1` only** (145 ENGROH rows dropped, n=1,367) | base 43.09% vs extended 42.06%, **−1.02pp, McNemar p = 0.1797 — not significant** |
+
+Per-seed deltas (extended − base, pp): −0.93, −1.06, −0.20, −0.46,
+**+0.73**, −0.26, −1.46.
+
+So: the magnitude is inside run-to-run variation and no single comparison
+clears p<0.05, but 6 of 7 seeds and both the accuracy and the backtest
+point the same way. **The defensible claim is "no improvement", with a
+mild negative lean — not "a significant degradation".**
+
+### Why — the relationship inverts out of sample
+
+This is the substantive finding. Terciles of `sector_flow_ratio` cut
+*within each split*, mean forward 5-day return (`flow_available == 1`
+rows only):
+
+| Split | n | low tercile | mid | high tercile | high − low |
+|---|---:|---:|---:|---:|---:|
+| train | 6,360 | +0.3177% | +0.6671% | **+1.4823%** | **+1.16pp** |
+| val | 1,359 | +1.5132% | +0.5750% | +1.5379% | +0.02pp |
+| test | 1,367 | +1.0855% | +0.6841% | **−0.8381%** | **−1.92pp** |
+
+UP-label rate by the same terciles:
+
+| Split | low | mid | high |
+|---|---:|---:|---:|
+| train | 37.5% | 40.8% | **44.1%** |
+| val | 50.3% | 39.4% | 43.3% |
+| test | 44.8% | 44.3% | **32.1%** |
+
+Pearson correlation of `sector_flow_ratio` with `forward_return_5d`:
+
+| Scope | n | r |
+|---|---:|---:|
+| all splits | 9,086 | +0.0334 |
+| train | 6,360 | +0.0666 |
+| val | 1,359 | −0.0193 |
+| test | 1,367 | **−0.1040** |
+
+In the training period the story works exactly as the Arbitrator's
+hand-picked term assumes — heavier net institutional buying precedes
+better 5-day returns, monotonically across terciles. In the validation
+period the effect vanishes. In the test period it **reverses**: the
+highest-inflow tercile has the *worst* forward returns and the *lowest*
+UP rate. A pooled all-splits correlation of +0.033 would have looked
+mildly encouraging and is, on this evidence, an artifact of the training
+period dominating the pool.
+
+### Before/after — backtest (identical methodology, same test window)
+
+Long-only regime-hold, close-to-close, equal-weight, one position/ticker,
+no leverage, `vectorbt==1.0.0`, 0.15%/side commission (0.30% round trip),
+15% CGT post-hoc applied identically to B&H, slippage not modelled. Same
+harness (`backtest_xgboost.py`, now with `--model`/`--features`) — the
+baseline column below was re-run this session and reproduced Session 6's
+published numbers exactly.
+
+| Metric | Base ungated | **Ext ungated** | Base gated | **Ext gated** | Buy & Hold |
+|---|---:|---:|---:|---:|---:|
+| Total return (pre-CGT) | **+18.36%** | +15.41% | +5.57% | +5.44% | +13.81% |
+| Total return (post-CGT) | +15.60% | +13.10% | +4.74% | +4.62% | +11.74% |
+| Ann. Sharpe | **+1.12** | +0.99 | +0.99 | +0.92 | +0.81 |
+| Max drawdown | −19.37% | **−19.19%** | −4.30% | **−4.10%** | −21.79% |
+| Win rate | 61.43% | 61.46% | 69.23% | 68.00% | n/a |
+| Trades | 70 | **96** | 26 | 25 | 0 |
+| Excess return vs B&H (pre-CGT) | **+4.55pp** | +1.60pp | −8.24pp | −8.37pp | — |
+| Excess Sharpe vs B&H | **+0.31** | +0.18 | +0.18 | +0.11 | — |
+| Test rows clearing the 0.55 gate | 99 / 1,512 | 103 / 1,512 | — | — | — |
+
+**Cost sensitivity (0.05%/side discount broker):** extended ungated
++17.69% pre-CGT / +15.04% post / Sharpe +1.10 / max DD −18.95% / win
+63.54% — vs base's +20.09% / +17.08% / +1.20 / −19.17%. The ordering is
+unchanged at lower cost, so this is not a fee artifact.
+
+The extended model trades **96 times vs 70** for less return — it flips
+regime more often without being more right, which is exactly how a noisy
+extra input costs money.
+
+### Per-ticker (shared window; ENGROH enters 2025-12-08)
+
+| Ticker | Base #UP | Ext #UP | Base ungated | Ext ungated | Base trades | Ext trades | Buy & Hold |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ENGROH | 140 | 134 | +39.17% | +39.04% | 5 | 8 | +29.87% |
+| HBL | 148 | 147 | −9.01% | **+3.55%** | 4 | 5 | +2.99% |
+| LUCK | 131 | 134 | −2.56% | −8.65% | 10 | 10 | +3.64% |
+| MARI | 33 | 49 | +23.56% | +16.67% | 20 | 26 | −3.61% |
+| MCB | 151 | 140 | +18.44% | +18.74% | 2 | 9 | +17.85% |
+| MEBL | 149 | 144 | +14.25% | +15.26% | 4 | 5 | +29.81% |
+| OGDC | 150 | 145 | +32.63% | +34.36% | 3 | 6 | +31.67% |
+| PPL | 136 | 134 | +22.50% | **+4.93%** | 7 | 9 | +19.04% |
+| PSO | 93 | 98 | −14.82% | −16.09% | 8 | 8 | −21.49% |
+| UBL | 110 | 108 | +59.77% | +46.60% | 14 | 17 | +28.65% |
+
+Per-ticker results move in both directions (HBL +12.6pp better, PPL
+−17.6pp worse) — more evidence that what changed is noise placement, not
+a systematic edge.
+
+### No-leakage proof (test-split only)
+
+Unchanged from Session 6 and re-asserted on both runs: `test_min >
+val_max` per ticker, `True` for all 10, cross-checked against
+`verify_dataset.py`'s independently derived boundaries (identical). The
+5-day forward label remains a training target only, never a trading
+input. The two new features add a *third* leakage surface — a flow window
+reaching past the row's own date — and that is separately proven above
+(0 violations of 9,086 windowed rows, plus 60/60 per-row re-fetches
+against production SQL).
+
+### Honest verdict
+
+**It does nothing. Report it as a negative result and do not wire it in.**
+
+1. **Accuracy: no improvement, mild negative lean.** 43.19% → 42.26% at
+   seed=42; −0.52pp averaged over 7 seeds; extended wins 1 of 7. No
+   comparison reaches p<0.05, so calling this "worse" would overstate it
+   — but there is no version of this result in which the feature helped.
+2. **Trading: worse where it counts.** Excess return over buy-and-hold
+   fell from +4.55pp to +1.60pp and excess Sharpe from +0.31 to +0.18,
+   with 37% more trades. Drawdown improved trivially (−19.37% →
+   −19.19%), which does not pay for the return give-up.
+3. **The hand-picked ±10 rule is not vindicated by this.** The question
+   asked was whether a model could learn a better mapping than the
+   Arbitrator's `clamp(ratio/0.125, −1, +1) × 10`. The answer is that
+   there was no stable mapping to learn over this window — which, read
+   alongside Phase 6 Session 2's finding that the composite score has no
+   relationship with forward returns, is *consistent with the flow term
+   contributing noise to production scoring today*. This session does not
+   prove that (it tested a different functional form on a different
+   target), but nothing here supports keeping the term on empirical
+   grounds.
+4. **The most useful thing learned is the instability, not the accuracy
+   number.** Train +1.16pp / val +0.02pp / test −1.92pp tercile spread,
+   and a correlation that flips sign from +0.067 to −0.104, is a clean
+   demonstration that the flow-to-return relationship is regime-dependent
+   over 2022–2026. Anyone tempted to revisit this should test *regime
+   stability first* on a wider window, not accuracy on this one.
+5. **Two structural limits cap what this experiment could ever have
+   shown.** Only 3 distinct flow series exist across the universe
+   (NCCPL is sector-level, never per-ticker), and the test window is one
+   ~7.4-month strongly-bullish regime — the same single-regime caveat
+   that has applied since Phase 5 Session 1. A sector-level feature
+   evaluated on 3 series over one regime is weak evidence either way; the
+   negative result is credible as "no usable edge here", not as "flow
+   data is worthless".
+6. **Production is unchanged.** `model.json` is still the 11-feature
+   Session 6 artifact, `arbitrator.py` is untouched, and no scoring
+   behavior moved. The experimental model exists only as
+   `ml_data/model_flow_phase7s1.json`.
+
+---
+
 ## Phase 6 Session 2 — composite conviction score vs forward returns, first-ever check (2026-09-10)
 
 **One-line answer:** across 200 point-in-time (ticker, date) pairs, the

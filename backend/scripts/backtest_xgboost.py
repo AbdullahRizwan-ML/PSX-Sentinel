@@ -117,6 +117,7 @@ USAGE (from backend/ with venv active):
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import warnings
@@ -131,11 +132,24 @@ import pandas as pd  # noqa: E402
 import vectorbt as vbt  # noqa: E402
 import xgboost as xgb  # noqa: E402
 
-from app.ml.features import FEATURE_COLUMNS  # noqa: E402
+from app.ml.features import (  # noqa: E402
+    EXTENDED_FEATURE_COLUMNS,
+    FEATURE_COLUMNS,
+)
 
 # ── Constants ────────────────────────────────────────────────────────────
 ML_DATA = Path(__file__).resolve().parent.parent / "ml_data"
 MODEL_PATH = ML_DATA / "model.json"
+
+# Phase 7 Session 1: the same harness can now score an alternative model
+# artifact over an alternative feature set (--model / --features), so an
+# experimental model is measured by IDENTICAL methodology rather than a
+# forked copy of this script. Defaults are unchanged: production
+# model.json over the 11 production columns.
+FEATURE_SETS = {
+    "base": FEATURE_COLUMNS,
+    "extended": EXTENDED_FEATURE_COLUMNS,
+}
 
 # Must match train_ml_model.py LABEL_TO_INT ordering exactly.
 CLASS_NAMES = ["DOWN", "FLAT", "UP"]
@@ -235,12 +249,16 @@ def apply_cgt(value: pd.Series) -> tuple[float, float]:
 
 # ── Core backtest per ticker ─────────────────────────────────────────────
 def build_signals(
-    df: pd.DataFrame, model: xgb.XGBClassifier
+    df: pd.DataFrame,
+    model: xgb.XGBClassifier,
+    feature_columns: list[str] = FEATURE_COLUMNS,
 ) -> pd.DataFrame:
     """Attach predicted_class, max_prob, and the two entry booleans to a
     single ticker's test rows (chronological)."""
     df = df.sort_values("date").reset_index(drop=True)
-    proba = model.predict_proba(df[FEATURE_COLUMNS].astype(float).to_numpy())
+    proba = model.predict_proba(
+        df[feature_columns].astype(float).to_numpy()
+    )
     max_idx = proba.argmax(axis=1)
     df = df.assign(
         pred=[CLASS_NAMES[i] for i in max_idx],
@@ -323,9 +341,25 @@ def _fmt_sharpe(x: float) -> str:
 
 # ── Main ─────────────────────────────────────────────────────────────────
 def main() -> None:
-    if not MODEL_PATH.exists():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--model",
+        default=str(MODEL_PATH),
+        help="model artifact to backtest (default: ml_data/model.json)",
+    )
+    ap.add_argument(
+        "--features",
+        choices=sorted(FEATURE_SETS),
+        default="base",
+        help="feature set the artifact was trained on (default: base)",
+    )
+    args = ap.parse_args()
+    model_path = Path(args.model)
+    feature_columns = FEATURE_SETS[args.features]
+
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"{MODEL_PATH} not found - run scripts/train_ml_model.py first."
+            f"{model_path} not found - run scripts/train_ml_model.py first."
         )
     test = pd.read_parquet(ML_DATA / "test.parquet")
     val = pd.read_parquet(ML_DATA / "val.parquet")
@@ -333,12 +367,14 @@ def main() -> None:
     val["date"] = pd.to_datetime(val["date"])
 
     model = xgb.XGBClassifier()
-    model.load_model(str(MODEL_PATH))
+    model.load_model(str(model_path))
 
     print("=" * 78)
     print("PSX SENTINEL - XGBoost out-of-sample backtest")
     print("=" * 78)
-    print(f"Model            : {MODEL_PATH.name} (loaded as-is, not retrained)")
+    print(f"Model            : {model_path.name} (loaded as-is, not retrained)")
+    print(f"Feature set      : {args.features} "
+          f"({len(feature_columns)} columns)")
     print(f"Test rows        : {len(test):,}  across {test['ticker'].nunique()} tickers")
     print(f"Confidence gate  : max_prob > {GATE}  (matches Arbitrator.ML_GATE)")
     print(
@@ -380,7 +416,9 @@ def main() -> None:
     per_ticker_rows = []
     total_gate_rows = 0
     for t in sorted(test["ticker"].unique()):
-        sig = build_signals(test[test["ticker"] == t], model)
+        sig = build_signals(
+            test[test["ticker"] == t], model, feature_columns
+        )
         total_gate_rows += int(sig["gated_long"].sum())
 
         g = run_strategy(sig, "gated_long", COMMISSION_PER_SIDE)

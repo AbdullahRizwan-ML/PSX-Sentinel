@@ -296,3 +296,203 @@ def build_features_point_in_time(
         "close": float(last["close"]),
         "features": {col: float(feature_values[col]) for col in FEATURE_COLUMNS},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 7 Session 1 — sector institutional-flow features (EXPERIMENTAL)
+# ─────────────────────────────────────────────────────────────────────
+#
+# These are NOT part of the production feature set. `FEATURE_COLUMNS`
+# above is what `build_features_point_in_time` emits and what the live
+# `ml_data/model.json` was trained on; it is deliberately unchanged.
+#
+# The two columns below extend that set for the Phase 7 Session 1
+# experiment: "does the sector FIPI/LIPI flow regime — one of only two
+# conviction-score terms that ever moves (Phase 6 Session 2) — carry
+# information a model can actually use?" They live here, next to the
+# technical features, because this module is the single source of truth
+# for feature DEFINITIONS. The DB fetch that supplies `flow_daily`
+# lives in scripts/build_ml_dataset.py, which reuses
+# AnalysisOrchestrator's already-settled sector map / SQL / window
+# constants rather than re-deriving them.
+#
+# Feature semantics:
+#   sector_flow_ratio  Sum(net_value) / Sum(gross_value) over the last
+#                      <= FLOW_LOOKBACK_DAYS (10) flow trading days at
+#                      or before the row's date, for the ticker's
+#                      mapped NCCPL sector(s). This is the RAW ratio in
+#                      [-1, +1] — the same quantity Arbitrator computes
+#                      before applying its hand-picked
+#                      clamp(ratio / 0.125, -1, +1) x 10 mapping. The
+#                      model is given the raw number precisely so it
+#                      can learn its own mapping instead of inheriting
+#                      the hand-picked one. 0.0 when unavailable.
+#   flow_available     1.0 when a real ratio was computed, 0.0 when
+#                      not. Required because 0.0 is ALSO a legitimate
+#                      "perfectly balanced flow regime" reading — the
+#                      model must be able to tell "no data" from
+#                      "neutral data". Same discipline as the
+#                      Arbitrator's honest-zero skip_reason paths,
+#                      whose exact gate conditions this mirrors.
+
+FLOW_FEATURE_COLUMNS: list[str] = [
+    "sector_flow_ratio",
+    "flow_available",
+]
+
+EXTENDED_FEATURE_COLUMNS: list[str] = FEATURE_COLUMNS + FLOW_FEATURE_COLUMNS
+
+# Non-feature diagnostic column written alongside them, so an
+# unavailable row's reason is auditable in the parquet rather than
+# collapsing into an anonymous zero.
+FLOW_DIAGNOSTIC_COLUMN = "flow_skip_reason"
+
+
+def attach_flow_features(
+    df: pd.DataFrame,
+    flow_daily: list[dict],
+    *,
+    sector_mapped: bool,
+    lookback_days: int,
+    min_days: int,
+    stale_days: int,
+) -> pd.DataFrame:
+    """
+    Attach `sector_flow_ratio` / `flow_available` / `flow_skip_reason`
+    to a labeled per-ticker frame, point-in-time safe.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Labeled rows for ONE ticker; must have a `date` column.
+    flow_daily : list[dict]
+        The ticker's sector aggregate, ascending by date, each
+        {"date": <date|str>, "net_value": float, "gross_value": float}
+        — exactly the shape AnalysisOrchestrator._build_sector_flows
+        returns, produced by the same SQL. Pass [] when the sector is
+        unmapped.
+    sector_mapped : bool
+        Whether the ticker's sector resolves to any NCCPL sector at
+        all. Distinguishes "unmapped sector" from "mapped, but the
+        archive happens to be empty here".
+    lookback_days, min_days, stale_days : int
+        Reused from AnalysisOrchestrator.FLOW_LOOKBACK_DAYS and
+        Arbitrator.FLOW_MIN_DAYS / FLOW_STALE_DAYS — passed in rather
+        than imported so this module stays pure-pandas with no app
+        imports (the offline path must not pull in SQLAlchemy or the
+        LLM gateway).
+
+    Point-in-time guarantee
+    -----------------------
+    For row date T the window is the last <= `lookback_days` flow
+    trading days with flow_date <= T, located by
+    `np.searchsorted(flow_dates, T, side="right")`. `side="right"`
+    admits a same-day flow row (T itself) and nothing after it, which
+    matches the orchestrator SQL's `date <= :report_date`. Callers are
+    expected to VERIFY the resulting `flow_window_end` <= `date` on the
+    real rows rather than trust this docstring — see
+    scripts/build_ml_dataset.py (whole-dataset assertion) and
+    scripts/verify_flow_features.py (independent per-row SQL re-fetch).
+
+    Returns
+    -------
+    pd.DataFrame
+        `df` plus the two feature columns, the diagnostic reason
+        column, and three audit columns (`flow_window_days`,
+        `flow_window_end`, `flow_staleness_days`) that the leakage
+        proof reads. Never raises; an unusable window yields an honest
+        zero carrying its reason.
+    """
+    out = df.copy()
+    n = len(out)
+    row_dates = pd.to_datetime(out["date"]).to_numpy(dtype="datetime64[ns]")
+
+    ratio = np.zeros(n, dtype=float)
+    available = np.zeros(n, dtype=float)
+    reason = np.array(["ok"] * n, dtype=object)
+    win_days = np.zeros(n, dtype=int)
+    win_end = np.array([None] * n, dtype=object)
+    staleness = np.full(n, np.nan, dtype=float)
+
+    if not sector_mapped:
+        reason[:] = "sector_not_covered_by_nccpl"
+        return _write_flow_columns(
+            out, ratio, available, reason, win_days, win_end, staleness
+        )
+
+    if not flow_daily:
+        reason[:] = "no_flow_rows_for_sector"
+        return _write_flow_columns(
+            out, ratio, available, reason, win_days, win_end, staleness
+        )
+
+    flow = pd.DataFrame(flow_daily)
+    flow["date"] = pd.to_datetime(flow["date"])
+    flow = flow.sort_values("date").reset_index(drop=True)
+
+    fdates = flow["date"].to_numpy(dtype="datetime64[ns]")
+    # Leading 0 so any window is a plain difference of two prefix sums.
+    cum_net = np.concatenate(
+        [[0.0], np.cumsum(flow["net_value"].to_numpy(dtype=float))]
+    )
+    cum_gross = np.concatenate(
+        [[0.0], np.cumsum(flow["gross_value"].to_numpy(dtype=float))]
+    )
+
+    # end_idx[i] = number of flow days at or before row i's date.
+    end_idx = np.searchsorted(fdates, row_dates, side="right")
+    start_idx = np.maximum(0, end_idx - lookback_days)
+    counts = end_idx - start_idx
+
+    net = cum_net[end_idx] - cum_net[start_idx]
+    gross = cum_gross[end_idx] - cum_gross[start_idx]
+
+    has_window = counts > 0
+    last_idx = np.maximum(end_idx - 1, 0)
+    stale_days_arr = (row_dates - fdates[last_idx]) / np.timedelta64(1, "D")
+
+    for i in range(n):
+        win_days[i] = int(counts[i])
+        if has_window[i]:
+            win_end[i] = (
+                pd.Timestamp(fdates[last_idx[i]]).date().isoformat()
+            )
+            staleness[i] = float(stale_days_arr[i])
+
+        if counts[i] < min_days:
+            reason[i] = (
+                f"insufficient_flow_history ({int(counts[i])} < {min_days})"
+            )
+            continue
+        if staleness[i] > stale_days:
+            reason[i] = (
+                f"stale_flow_data ({int(staleness[i])}d > {stale_days}d)"
+            )
+            continue
+        if gross[i] <= 0:
+            reason[i] = "zero_gross_turnover"
+            continue
+        ratio[i] = float(net[i] / gross[i])
+        available[i] = 1.0
+
+    return _write_flow_columns(
+        out, ratio, available, reason, win_days, win_end, staleness
+    )
+
+
+def _write_flow_columns(
+    out: pd.DataFrame,
+    ratio: np.ndarray,
+    available: np.ndarray,
+    reason: np.ndarray,
+    win_days: np.ndarray,
+    win_end: np.ndarray,
+    staleness: np.ndarray,
+) -> pd.DataFrame:
+    out["sector_flow_ratio"] = ratio
+    out["flow_available"] = available
+    out[FLOW_DIAGNOSTIC_COLUMN] = reason
+    out["flow_window_days"] = win_days
+    out["flow_window_end"] = win_end
+    out["flow_staleness_days"] = staleness
+    return out

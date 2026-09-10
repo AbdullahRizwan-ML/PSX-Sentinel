@@ -1,13 +1,38 @@
 """
-PSX Sentinel — ML dataset builder (Phase 3 Session 1)
+PSX Sentinel — ML dataset builder (Phase 3 Session 1, extended Phase 7
+Session 1)
 
 Pulls all `daily_prices` for every configured ticker from the live
-Postgres, runs the feature pipeline per ticker, performs a per-ticker
-chronological 70/15/15 train/val/test split, and writes three parquet
-files to backend/ml_data/.
+Postgres, runs the feature pipeline per ticker, attaches the sector
+institutional-flow features, performs a per-ticker chronological
+70/15/15 train/val/test split, and writes three parquet files to
+backend/ml_data/.
 
-This script does NOT train any model. Model training is Phase 3
-Session 2 — it will load the parquet files this script produces.
+This script does NOT train any model. `scripts/train_ml_model.py` loads
+the parquet files this script produces.
+
+Phase 7 Session 1 addition — sector FIPI/LIPI flow features:
+    Two extra feature columns (`sector_flow_ratio`, `flow_available`)
+    plus four audit columns are written per row. The math lives in
+    app/ml/features.py::attach_flow_features; the DB fetch here reuses
+    AnalysisOrchestrator's ALREADY-SETTLED constants and SQL verbatim
+    (NCCPL_SECTOR_MAP, FLOW_LOOKBACK_DAYS, LIPI_RETAIL_TYPES,
+    _SECTOR_FLOW_SQL) and Arbitrator's gate thresholds (FLOW_MIN_DAYS,
+    FLOW_STALE_DAYS) — nothing about the sector mapping or the flow
+    variant is re-derived here.
+
+    Efficiency note: fetching the last-10-flow-days window per row
+    would be ~10,000 round trips, so the full per-date sector aggregate
+    is fetched ONCE per distinct NCCPL sector set (using that same SQL
+    with an unbounded LIMIT) and the per-row window is taken from it in
+    pandas. That is the same set of rows the per-row query would
+    return — verified per-row against the real SQL by
+    scripts/verify_flow_features.py, not assumed.
+
+    The 11-column production feature set (features.FEATURE_COLUMNS) is
+    UNCHANGED, and so are the labels and the split boundaries: the new
+    columns are purely additive, so the existing 11-feature training
+    path reads these same parquet files untouched.
 
 Why per-ticker chronological split (not random):
     Adjacent rows share almost all of their feature window (e.g. two
@@ -42,11 +67,18 @@ import pandas as pd  # noqa: E402
 from loguru import logger  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
+from datetime import date  # noqa: E402
+
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "ml_data"
 
 TRAIN_FRAC = 0.70
 VAL_FRAC = 0.15
 # test = 1 - TRAIN_FRAC - VAL_FRAC = 0.15
+
+# Far-future bound used to pull the FULL sector-flow series through the
+# orchestrator's point-in-time SQL (which filters `date <= :report_date`).
+FLOW_SERIES_END = date.max
+FLOW_SERIES_LIMIT = 10_000_000
 
 
 async def load_prices_for_ticker(db, ticker: str) -> pd.DataFrame:
@@ -69,6 +101,49 @@ async def load_prices_for_ticker(db, ticker: str) -> pd.DataFrame:
     return pd.DataFrame(
         rows, columns=["date", "open", "high", "low", "close", "volume"]
     )
+
+
+async def load_company_sectors(db) -> dict[str, str]:
+    """ticker -> companies.sector label, for the NCCPL sector mapping."""
+    from app.db.models import Company
+
+    result = await db.execute(select(Company.ticker, Company.sector))
+    return {row.ticker: (row.sector or "") for row in result.all()}
+
+
+async def load_sector_flow_series(db, nccpl_sectors: list[str]) -> list[dict]:
+    """
+    Full per-date net/gross aggregate for a set of NCCPL sectors, using
+    AnalysisOrchestrator._SECTOR_FLOW_SQL verbatim with an unbounded
+    window. Ascending by date.
+
+    Reusing that SQL object (rather than writing a new query) is what
+    guarantees the training feature is computed from exactly the same
+    variant definition the production Arbitrator term uses: FIPI +
+    local-institutional LIPI, REG/REGULAR market, sector-wise datasets,
+    retail client types excluded.
+    """
+    from app.agents.orchestrator import _SECTOR_FLOW_SQL, LIPI_RETAIL_TYPES
+
+    rows = await db.execute(
+        _SECTOR_FLOW_SQL,
+        {
+            "retail": LIPI_RETAIL_TYPES,
+            "sectors": nccpl_sectors,
+            "report_date": FLOW_SERIES_END,
+            "lookback": FLOW_SERIES_LIMIT,
+        },
+    )
+    daily = [
+        {
+            "date": str(r.date),
+            "net_value": float(r.net_value or 0.0),
+            "gross_value": float(r.gross_value or 0.0),
+        }
+        for r in rows.all()
+    ]
+    daily.reverse()  # SQL orders DESC for its LIMIT; serve ascending
+    return daily
 
 
 def chronological_split(df: pd.DataFrame) -> pd.DataFrame:
@@ -99,9 +174,19 @@ def _fmt_date(value) -> str:
 
 
 async def main() -> None:
+    from app.agents.arbitrator import Arbitrator
+    from app.agents.orchestrator import (
+        FLOW_LOOKBACK_DAYS,
+        NCCPL_SECTOR_MAP,
+    )
     from app.core.config import get_settings
     from app.db.session import AsyncSessionLocal
-    from app.ml.features import build_features
+    from app.ml.features import (
+        EXTENDED_FEATURE_COLUMNS,
+        FLOW_FEATURE_COLUMNS,
+        attach_flow_features,
+        build_features,
+    )
     from app.ml.split_adjustments import (
         SPLIT_ADJUSTMENTS,
         apply_split_adjustments,
@@ -126,8 +211,18 @@ async def main() -> None:
     raw_row_total = 0
     dropped_total = 0
     per_ticker_stats: dict[str, dict] = {}
+    flow_cache: dict[tuple[str, ...], list[dict]] = {}
 
     async with AsyncSessionLocal() as db:
+        sectors = await load_company_sectors(db)
+        logger.info(
+            "Flow features: gates min_days={}, stale_days={}, "
+            "lookback={} (reused from Arbitrator / orchestrator)",
+            Arbitrator.FLOW_MIN_DAYS,
+            Arbitrator.FLOW_STALE_DAYS,
+            FLOW_LOOKBACK_DAYS,
+        )
+
         for ticker in tickers:
             prices = await load_prices_for_ticker(db, ticker)
             n_raw = len(prices)
@@ -154,6 +249,30 @@ async def main() -> None:
             labeled = build_features(prices, ticker=ticker)
             n_labeled = len(labeled)
             dropped_total += n_raw - n_labeled
+
+            # ── Phase 7 Session 1: sector institutional-flow features ──
+            sector = sectors.get(ticker, "")
+            mapped = NCCPL_SECTOR_MAP.get(sector, [])
+            key = tuple(mapped)
+            if mapped and key not in flow_cache:
+                flow_cache[key] = await load_sector_flow_series(db, mapped)
+                logger.info(
+                    f"  fetched flow series for {list(mapped)}: "
+                    f"{len(flow_cache[key])} flow days"
+                )
+            labeled = attach_flow_features(
+                labeled,
+                flow_cache.get(key, []),
+                sector_mapped=bool(mapped),
+                lookback_days=FLOW_LOOKBACK_DAYS,
+                min_days=Arbitrator.FLOW_MIN_DAYS,
+                stale_days=Arbitrator.FLOW_STALE_DAYS,
+            )
+            n_avail = int(labeled["flow_available"].sum())
+            logger.info(
+                f"  {ticker}: sector='{sector}' -> {list(mapped) or 'UNMAPPED'}, "
+                f"flow_available on {n_avail}/{n_labeled} rows"
+            )
 
             split_df = chronological_split(labeled)
 
@@ -263,6 +382,62 @@ async def main() -> None:
             f"{_fmt_date(s['train_cut']):<12} "
             f"{_fmt_date(s['val_cut']):<12}"
         )
+    print()
+
+    print("FLOW FEATURE COVERAGE (Phase 7 Session 1)")
+    print("-" * 78)
+    print(f"Feature columns now written: {len(EXTENDED_FEATURE_COLUMNS)} "
+          f"({len(EXTENDED_FEATURE_COLUMNS) - len(FLOW_FEATURE_COLUMNS)} "
+          f"production + {len(FLOW_FEATURE_COLUMNS)} experimental: "
+          f"{FLOW_FEATURE_COLUMNS})")
+    print()
+    print(f"{'Ticker':<8} {'Rows':>6} {'flow_avail':>11} {'%':>6} "
+          f"{'mean ratio':>11} {'min':>8} {'max':>8}")
+    for t in full["ticker"].unique():
+        sub = full[full["ticker"] == t]
+        av = sub[sub["flow_available"] == 1.0]
+        pct = len(av) / len(sub) * 100.0 if len(sub) else 0.0
+        if len(av):
+            print(
+                f"{t:<8} {len(sub):>6} {len(av):>11} {pct:>5.1f}% "
+                f"{av['sector_flow_ratio'].mean():>11.5f} "
+                f"{av['sector_flow_ratio'].min():>8.4f} "
+                f"{av['sector_flow_ratio'].max():>8.4f}"
+            )
+        else:
+            print(
+                f"{t:<8} {len(sub):>6} {len(av):>11} {pct:>5.1f}% "
+                f"{'n/a':>11} {'n/a':>8} {'n/a':>8}"
+            )
+    print()
+    print("flow_skip_reason distribution (rows with flow_available = 0):")
+    unavail = full[full["flow_available"] == 0.0]
+    if len(unavail) == 0:
+        print("  (none — every row got a real flow reading)")
+    else:
+        for reason, n in unavail["flow_skip_reason"].value_counts().items():
+            print(f"  {n:>6}  {reason}")
+    print()
+
+    # ── Point-in-time proof, on the real rows, not the SQL WHERE clause ──
+    print("FLOW FEATURE POINT-IN-TIME CHECK (every row, not a sample)")
+    print("-" * 78)
+    checked = full[full["flow_window_end"].notna()].copy()
+    checked["_we"] = pd.to_datetime(checked["flow_window_end"])
+    violations = checked[checked["_we"] > pd.to_datetime(checked["date"])]
+    print(f"  rows with a flow window:            {len(checked):>7,}")
+    print(f"  rows whose window ends AFTER date:  {len(violations):>7,}")
+    if len(violations):
+        print("  !! LEAKAGE — sample of violating rows:")
+        print(violations[["ticker", "date", "flow_window_end"]].head(10)
+              .to_string(index=False))
+        raise SystemExit(
+            "ABORT: flow feature leaked future data. Dataset NOT trusted."
+        )
+    print("  [OK] every flow window ends on or before its own row's date")
+    print(f"  max staleness observed (days):      "
+          f"{checked['flow_staleness_days'].max():>7.0f}  "
+          f"(gate: > {Arbitrator.FLOW_STALE_DAYS} => unavailable)")
     print()
 
     print("CLASS DISTRIBUTION (label = UP / DOWN / FLAT)")

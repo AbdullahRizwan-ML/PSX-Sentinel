@@ -4812,3 +4812,121 @@ doc that n=174 is really 9 tickers plus a partial PSO, not a clean
 only.
 
 **End of session: local `main` pushed, HEAD == origin/main.**
+
+## 2026-09-10 — Phase 7 Session 1: sector flow as an ML feature — negative result
+
+**Verdict up front: it does nothing.** Test accuracy **43.19% → 42.26%**,
+ungated sleeve return **+18.36% → +15.41%** (Sharpe 1.12 → 0.99) on the
+identical test window. Not statistically significant (McNemar p = 0.19),
+but 6 of 7 seeds move the same way (mean delta −0.52pp, extended wins
+1/7). **Not wired into production. `arbitrator.py` untouched.** Full
+numbers in `docs/BACKTEST_RESULTS.md`.
+
+### What was built
+
+Two experimental features added *alongside* — never replacing — the 11
+production ones: `sector_flow_ratio` (the raw Σnet/Σgross imbalance over
+the last ≤10 flow trading days for the ticker's mapped NCCPL sector(s),
+i.e. the same quantity `Arbitrator._flow_contribution` computes *before*
+its hand-picked `clamp(ratio/0.125, −1, +1) × 10` mapping) and
+`flow_available` (0/1). The model gets the raw ratio precisely so it can
+learn its own mapping rather than inherit the hand-picked one, and the
+boolean so it can tell "no data" from "flat regime" — the same
+honest-zero discipline the Arbitrator's `skip_reason` paths use, whose
+gate conditions (`FLOW_MIN_DAYS`, `FLOW_STALE_DAYS`) this mirrors exactly.
+
+Production constants were **reused, not re-derived**: `NCCPL_SECTOR_MAP`,
+`FLOW_LOOKBACK_DAYS`, `LIPI_RETAIL_TYPES` and `_SECTOR_FLOW_SQL` are
+imported from `orchestrator.py`; the gates from `Arbitrator`. Math lives
+in `features.py` (still pure-pandas, no app imports); the DB fetch lives
+in `build_ml_dataset.py`.
+
+**Zero LLM calls this session** — both features are pure numbers.
+
+### The comparison is genuinely one-variable
+
+The rebuilt dataset is a provable superset of Session 6's: 10,050 rows
+(7,034/1,504/1,512), and the **16 base columns are byte-identical**
+(`assert_frame_equal`, `check_exact=True`) across all three splits, with
+identical per-ticker split boundaries. The control retrain (11 features,
+same data, seed=42) hit **43.19%, best iteration 34 — and its artifact is
+SHA-256-identical to production `model.json`**. The control isn't close
+to the documented baseline, it *is* the baseline, bit for bit, so every
+delta below is attributable to the two columns and nothing else.
+
+### Leakage: proven per-row against production SQL, not asserted
+
+The builder fetches each sector's full flow series once and slices the
+per-row window in pandas (~10,000 per-row queries would be unusable).
+That shortcut was verified rather than trusted —
+`scripts/verify_flow_features.py` re-runs the REAL `_SECTOR_FLOW_SQL`
+with `report_date` = each sampled row's own date and recomputes ratio +
+gate from scratch: **60/60 exact match** (1e-12), **60/60 point-in-time
+against the returned rows** (not the `WHERE` clause), and **0 violations
+across all 9,086 windowed rows**. Max staleness observed: 0 days — every
+labeled row date has a same-day flow row, so the 14-day staleness gate
+never fires inside the dataset.
+
+### Why it failed — the interesting part
+
+**Not the "near-zero importance" outcome the brief anticipated.** The
+model spent 16.4% of total gain on the two columns (`flow_available` #2
+of 13 at 0.0895, `sector_flow_ratio` #8 at 0.0746) and *still* came out
+worse. High in-sample importance with no out-of-sample gain means the
+relationship doesn't hold forward — and it's directly visible:
+
+| Tercile spread of forward 5d return (high − low) | train | val | test |
+|---|---:|---:|---:|
+| by `sector_flow_ratio` | **+1.16pp** | +0.02pp | **−1.92pp** |
+| Pearson r vs forward return | +0.0666 | −0.0193 | **−0.1040** |
+
+In training, heavier net institutional buying precedes better returns,
+monotonically — exactly the story the production term assumes. In test it
+**inverts**: highest-inflow tercile has the worst returns (−0.84%) and
+lowest UP rate (32.1% vs 44.8%). The pooled all-splits r of +0.033 would
+have looked mildly encouraging and is an artifact of train dominating the
+pool. **The finding worth carrying forward is the instability, not the
+accuracy number.**
+
+Two structural caveats recorded honestly: `flow_available` is a **perfect
+ENGROH indicator** in this dataset (100% coverage for the 9 mapped
+tickers, 0% for ENGROH's unmapped "Investment Companies"), so its #2 gain
+rank may be a ticker dummy — though dropping ENGROH's rows leaves the
+extended model still worse (−1.02pp). And NCCPL's sector-level
+granularity means there are only **3 distinct flow series** across 10
+tickers (Banks / O&G / Cement), so 9,086 rows are ~3 independent series.
+
+### Reading it against Phase 6 Session 2
+
+Session 2 found the composite score has no relationship with forward
+returns, and that flow was one of only two terms that ever moves. This
+session finds no stable mapping from that flow ratio to forward returns
+over the same window. Together that is **consistent with the production
+flow term contributing noise today** — this session does not prove it (it
+tested a different functional form on a different target), but nothing
+here supports keeping the term on empirical grounds.
+
+### Judgment call worth flagging
+
+Prior retrains archived the old artifact and overwrote `model.json`.
+**Not done here, deliberately:** a 13-feature model cannot be served by
+the live path (`app/ml/inference.py` builds an 11-value vector from
+prices alone), so overwriting would have been a silent production break
+rather than an experiment — and the brief forbids wiring anything in. The
+trainer now **refuses** that overwrite with an explicit error. Session 6's
+artifact was still archived (`model_phase5s6_backup.json`) per convention;
+the new models are `model_base_phase7s1.json` (control) and
+`model_flow_phase7s1.json` (treatment).
+
+### Scope
+
+`git diff --name-only` confirms `arbitrator.py`, `orchestrator.py`,
+`trend_analyzer.py`, `news_synthesizer.py`, `filing_skeptic.py` and
+`context_builder.py` all untouched. Changed: `app/ml/features.py`
+(additive), `scripts/build_ml_dataset.py`, `scripts/train_ml_model.py`
+(`--features`/`--model-out`), `scripts/backtest_xgboost.py`
+(`--model`/`--features`; defaults unchanged, baseline re-run reproduced
+Session 6's published numbers exactly), plus new
+`scripts/verify_flow_features.py` and two doc sections.
+
+**End of session: local `main` pushed, HEAD == origin/main.**
